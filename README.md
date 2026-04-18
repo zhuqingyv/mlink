@@ -1,47 +1,44 @@
 # mlink
 
-BLE-based local agent communication core.
+多对多本地设备连接层，transport 可插拔。
 
 ## What
 
-mlink 让不同设备上的 agent 通过蓝牙 BLE 直接通信，不依赖 WiFi、局域网或公网。适用于网络隔离环境下的多设备 agent 协作。
+mlink 在设备之间建立可靠的多对多连接，不依赖 WiFi / 局域网 / 公网。它是一层哑管道 — 像 TCP 一样只负责把字节可靠送达，不做业务判断。
 
 ## Why
 
-- 公司 WiFi 做了 VLAN 隔离，设备之间无法通过网络通信
-- USB / Thunderbolt 物理端口被管控
-- AirDrop / WiFi Direct 被 MDM 禁用
-- 蓝牙 BLE 是唯一不受企业网络策略限制的本地无线通道
+网络隔离环境下（VLAN 隔离、端口管控、MDM 限制），设备间仍然需要可靠的通信通道。mlink 把"连接"这件事抽象出来，让上层应用不必关心底层走的是 BLE 还是其他链路。
 
-## Use Cases
+## Features
 
-- **Agent 间通信** — 多台设备上的 AI agent 互相发送指令、同步状态
-- **知识库服务** — 一台设备部署知识库，通过 BLE 对其他设备提供查询服务
-- **CLI / MCP 集成** — 作为 transport layer 集成到 CLI 工具和 MCP server
-
-## Tech Stack
-
-- BLE 5.0+ (2M PHY, ~1.2 Mbps)
-- 跨平台: macOS / Windows / Linux
-- 自动发现、自动连接、无需手动配对
-- 消息分片/重组、心跳重连、压缩
+- 自动发现 — 无需手动配对或输入地址
+- 多对多连接 — 一台设备可同时与多台设备通信
+- 二进制序列化 + 流式压缩 — msgpack + zstd
+- 流式传输 + 断点续传 — 大消息分片，中断后可续
+- 断线自动重连 — 链路抖动对上层透明
+- Transport 可插拔 — BLE / IPC / 未来更多
 
 ## Architecture
 
 ```
-Device A                          Device B
-┌──────────────┐                 ┌──────────────┐
-│  Agent / CLI │                 │  Agent / CLI │
-│      │       │                 │      │       │
-│  mlink core  │                 │  mlink core  │
-│      │       │                 │      │       │
-│  BLE Service │ ◄── BLE 5.0 ──►│  BLE Service │
-└──────────────┘                 └──────────────┘
+┌─────────────┐     ┌──────────────────────┐     ┌────────────────┐
+│ Application │ ◄─► │ mlink (Protocol+API) │ ◄─► │ Transport      │
+│             │     │                      │     │ BLE / IPC /... │
+└─────────────┘     └──────────────────────┘     └────────────────┘
 ```
+
+## Tech Stack
+
+- Rust
+- btleplug (BLE)
+- tokio (async runtime)
+- msgpack (序列化)
+- zstd (流式压缩)
 
 ## Status
 
-Early stage. Under active development.
+Early stage.
 
 ## License
 
