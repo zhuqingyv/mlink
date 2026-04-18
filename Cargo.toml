@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/mlink-core",
+    "crates/mlink-cli",
+]
+resolver = "2"

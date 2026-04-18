@@ -1,0 +1,19 @@
+[package]
+name = "mlink-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+btleplug = "0.11"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+zstd = "0.13"
+ring = "0.17"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"

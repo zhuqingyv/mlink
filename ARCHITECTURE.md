@@ -532,18 +532,68 @@ MTU 协商失败 → 回落到 ATT 默认 23B → 可用 12B/chunk (极慢，日
 
 ---
 
-## 8. 安全
+## 8. 安全 (协议层内置)
+
+安全是协议层的事，不是应用层的事。上层不需要关心加密和认证。
+
+### 8.1 首次连接：验证码确认
 
 ```
-Transport 层: 各 transport 自有加密 (BLE: LESC, TCP: TLS)
+Device A 扫到 Device B:
 
-应用层 (可选):
-  - HANDSHAKE 交换 pre-shared key 的 HMAC
-  - AES-256-GCM 加密 payload
-  - 默认不加密 (本地信任环境)
-  - 通过配置启用: encrypt: true, psk: "..."
+1. 双方通过 ECDH (X25519) 协商临时密钥
+2. 从共享密钥派生 6 位验证码
 
-crate: ring
+   Device A 屏幕: 确认连接? 验证码 [847291]
+   Device B 屏幕: 确认连接? 验证码 [847291]
+
+3. 双方用户确认数字一致 → 连接建立
+4. 验证码不一致 → 中间人攻击，拒绝连接
+
+类似蓝牙配对的 Numeric Comparison，但在 mlink 协议层实现，
+不依赖 BLE 底层配对（跨 transport 通用）。
+```
+
+### 8.2 信任持久化
+
+```
+首次验证通过后:
+  - 双方交换各自的 app_uuid + 公钥
+  - 存入本地信任列表: ~/.mlink/trusted_peers.json
+  
+后续重连:
+  - HANDSHAKE 阶段校验 app_uuid + 公钥签名
+  - 匹配信任列表 → 自动连接，不再弹验证码
+  - 不匹配 → 当作新设备，重新走验证码流程
+
+信任可撤销:
+  mlink untrust <peer-id>    # CLI 移除信任
+```
+
+### 8.3 通信加密 (默认开启)
+
+```
+HANDSHAKE 完成后所有 payload 默认 AES-256-GCM 加密:
+
+  发送: plaintext → AES-256-GCM encrypt → 密文 (FLAGS bit6 = 1)
+  接收: 密文 → AES-256-GCM decrypt → plaintext
+
+密钥: ECDH 共享密钥经 HKDF 派生
+每条消息独立 nonce (SEQ 作为 nonce 的一部分，防重放)
+
+可选关闭 (调试/测试场景):
+  Node::new(NodeConfig { encrypt: false, .. })
+
+crate: ring (X25519 + AES-256-GCM + HKDF)
+```
+
+### 8.4 FLAGS 更新
+
+```
+FLAGS byte:
+  bit7 = 压缩标志 (zstd)
+  bit6 = 加密标志 (AES-256-GCM)
+  bit0-5 = 消息类型 (0~63)
 ```
 
 ---
@@ -558,8 +608,8 @@ use mlink::{Node, NodeConfig, Peer, MlinkError};
 // ─── 创建节点 ───
 let node = Node::new(NodeConfig {
     name: "node-a".into(),
-    encrypt: false,
-    psk: None,
+    // encrypt: true,          // 默认开启，可选关闭
+    // trust_store: None,      // 默认 ~/.mlink/trusted_peers.json
 }).await?;
 
 node.start().await?;   // 开始扫描 + 广播
@@ -658,8 +708,12 @@ pub enum MlinkError {
 mlink scan                        # 扫描附近 mlink 设备
 
 # 连接管理
-mlink connect <peer-id>           # 手动连接
+mlink connect <peer-id>           # 连接 (首次弹验证码)
 mlink status                      # 查看当前连接状态
+
+# 信任管理
+mlink trust list                  # 查看已信任设备
+mlink trust remove <peer-id>     # 撤销信任
 
 # 诊断
 mlink ping <peer-id>              # 测试延迟
