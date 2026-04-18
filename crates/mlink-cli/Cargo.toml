@@ -7,4 +7,5 @@ edition = "2021"
 mlink-core = { path = "../mlink-core" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
 tracing-subscriber = "0.3"

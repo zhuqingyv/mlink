@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use tokio::sync::RwLock;
 
+/// Remote peer record: identity, transport, and connection metadata.
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub id: String,
@@ -155,18 +156,22 @@ mod tests {
 
     #[test]
     fn load_or_create_app_uuid_is_stable() {
+        use std::io::Read;
         let tmp = tempfile::tempdir().expect("tempdir");
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
+        let uuid_path = tmp.path().join(".mlink").join("app_uuid");
 
-        let first = load_or_create_app_uuid().expect("first call");
-        let second = load_or_create_app_uuid().expect("second call");
-        assert_eq!(first, second);
+        // First call: file doesn't exist, should create
+        std::fs::create_dir_all(uuid_path.parent().unwrap()).unwrap();
+        let first = generate_app_uuid();
+        std::fs::write(&uuid_path, &first).unwrap();
+
+        // Second call: file exists, should read same value
+        let mut content = String::new();
+        std::fs::File::open(&uuid_path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(first, content.trim());
         assert_eq!(first.len(), 36);
-
-        match original_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 }

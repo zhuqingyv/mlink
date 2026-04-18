@@ -675,6 +675,7 @@ dependencies = [
  "clap",
  "mlink-core",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

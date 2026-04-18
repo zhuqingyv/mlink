@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// Canonical error type for mlink: protocol, transport, security, and IO failures.
 #[derive(Debug, Error)]
 pub enum MlinkError {
     #[error("request timed out")]

@@ -19,6 +19,7 @@ pub struct DiscoveredPeer {
     pub metadata: Vec<u8>,
 }
 
+/// A live byte-oriented connection to a peer on a specific `Transport`.
 #[async_trait]
 pub trait Connection: Send + Sync {
     async fn read(&mut self) -> Result<Vec<u8>>;
@@ -27,6 +28,7 @@ pub trait Connection: Send + Sync {
     fn peer_id(&self) -> &str;
 }
 
+/// Pluggable link-layer: BLE, IPC, mock, or any bidirectional byte channel.
 #[async_trait]
 pub trait Transport: Send + Sync {
     fn id(&self) -> &str;

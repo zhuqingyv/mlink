@@ -84,6 +84,7 @@ pub enum NodeEvent {
     Reconnecting { peer_id: String, attempt: u32 },
 }
 
+/// Top-level mlink endpoint: owns peers, connections, trust store, and events.
 pub struct Node {
     config: NodeConfig,
     app_uuid: String,
