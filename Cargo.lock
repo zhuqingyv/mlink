@@ -685,6 +685,7 @@ dependencies = [
  "async-trait",
  "btleplug",
  "bytes",
+ "futures",
  "ring",
  "rmp-serde",
  "serde",
