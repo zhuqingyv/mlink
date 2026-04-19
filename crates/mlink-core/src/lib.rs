@@ -37,6 +37,7 @@ pub use crate::protocol::compress;
 // ---- transport -------------------------------------------------------------
 pub use crate::transport::{Connection, DiscoveredPeer, Transport, TransportCapabilities};
 pub use crate::transport::ble::BleTransport;
+#[cfg(unix)]
 pub use crate::transport::ipc::IpcTransport;
 pub use crate::transport::mock::{mock_pair, MockConnection, MockTransport};
 

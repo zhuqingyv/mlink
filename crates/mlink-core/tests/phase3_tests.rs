@@ -3,6 +3,7 @@ use std::time::Duration;
 use mlink_core::transport::ble::{
     BleTransport, CTRL_CHAR_UUID, MLINK_SERVICE_UUID, RX_CHAR_UUID, TX_CHAR_UUID,
 };
+#[cfg(unix)]
 use mlink_core::transport::ipc::IpcTransport;
 use mlink_core::transport::mock::{mock_pair, MockTransport};
 use mlink_core::transport::{Connection, DiscoveredPeer, Transport};
@@ -115,9 +116,10 @@ fn test_ble_service_uuids() {
 }
 
 // ============================================================================
-// ipc transport
+// ipc transport (unix-only)
 // ============================================================================
 
+#[cfg(unix)]
 fn ipc_peer(path: &str) -> DiscoveredPeer {
     DiscoveredPeer {
         id: path.to_string(),
@@ -127,6 +129,7 @@ fn ipc_peer(path: &str) -> DiscoveredPeer {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_ipc_listen_connect() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -158,6 +161,7 @@ async fn test_ipc_listen_connect() {
     server.await.expect("server task join");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_ipc_large_message() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -193,6 +197,7 @@ async fn test_ipc_large_message() {
     server.await.expect("server join");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_ipc_multiple_messages() {
     let dir = tempfile::tempdir().expect("tempdir");

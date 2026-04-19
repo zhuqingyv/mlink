@@ -2,6 +2,7 @@
 mod transport_trait;
 
 pub mod ble;
+#[cfg(unix)]
 pub mod ipc;
 pub mod mock;
 pub mod tcp;
