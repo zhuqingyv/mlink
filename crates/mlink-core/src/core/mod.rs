@@ -2,6 +2,7 @@ pub mod connection;
 pub mod node;
 pub mod peer;
 pub mod reconnect;
+pub mod room;
 pub mod scanner;
 pub mod security;
 

@@ -41,6 +41,8 @@ pub struct BleTransport {
     adapter: Option<Adapter>,
     negotiated_mtu: usize,
     scan_duration: Duration,
+    local_name: String,
+    room_hash: Option<[u8; 8]>,
 }
 
 impl BleTransport {
@@ -49,6 +51,8 @@ impl BleTransport {
             adapter: None,
             negotiated_mtu: DEFAULT_MTU,
             scan_duration: DEFAULT_SCAN_DURATION,
+            local_name: "mlink".into(),
+            room_hash: None,
         }
     }
 
@@ -59,6 +63,25 @@ impl BleTransport {
 
     pub fn set_negotiated_mtu(&mut self, mtu: usize) {
         self.negotiated_mtu = mtu;
+    }
+
+    /// Set the local name advertised when acting as peripheral.
+    pub fn set_local_name(&mut self, name: impl Into<String>) {
+        self.local_name = name.into();
+    }
+
+    /// Set the room hash (8 bytes) woven into the advertisement payload.
+    /// Used by the peer-side scanner to filter peripherals by room code.
+    pub fn set_room_hash(&mut self, hash: [u8; 8]) {
+        self.room_hash = Some(hash);
+    }
+
+    pub fn clear_room_hash(&mut self) {
+        self.room_hash = None;
+    }
+
+    pub fn room_hash(&self) -> Option<&[u8; 8]> {
+        self.room_hash.as_ref()
     }
 
     async fn ensure_adapter(&mut self) -> Result<&Adapter> {
@@ -173,11 +196,25 @@ impl Transport for BleTransport {
     }
 
     async fn listen(&mut self) -> Result<Box<dyn Connection>> {
-        Err(MlinkError::HandlerError(
-            "BleTransport::listen unsupported: btleplug has no peripheral-role API on macOS; \
-             advertise via a platform-specific peripheral implementation instead"
-                .into(),
-        ))
+        #[cfg(target_os = "macos")]
+        {
+            use super::peripheral::{MacPeripheral, MacPeripheralConnection};
+
+            let peripheral = MacPeripheral::start(self.local_name.clone(), self.room_hash).await?;
+            let peripheral = std::sync::Arc::new(peripheral);
+            let central_id = peripheral.wait_for_central().await?;
+            let conn = MacPeripheralConnection::new(central_id, peripheral);
+            Ok(Box::new(conn))
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(MlinkError::HandlerError(
+                "BleTransport::listen unsupported on this platform: btleplug has no peripheral-role \
+                 API; only macOS has a native CBPeripheralManager bridge"
+                    .into(),
+            ))
+        }
     }
 
     fn mtu(&self) -> usize {
@@ -294,6 +331,7 @@ mod tests {
         assert_eq!(t.mtu(), 247);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn listen_returns_error_with_explanation() {
         let mut t = BleTransport::new();
@@ -308,5 +346,23 @@ mod tests {
             }
             other => panic!("expected HandlerError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn room_hash_round_trips() {
+        let mut t = BleTransport::new();
+        assert!(t.room_hash().is_none());
+        let hash = [0xAB; 8];
+        t.set_room_hash(hash);
+        assert_eq!(t.room_hash(), Some(&hash));
+        t.clear_room_hash();
+        assert!(t.room_hash().is_none());
+    }
+
+    #[test]
+    fn set_local_name_updates_field() {
+        let mut t = BleTransport::new();
+        t.set_local_name("mlink-node-a");
+        assert_eq!(t.local_name, "mlink-node-a");
     }
 }

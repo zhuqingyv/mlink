@@ -18,6 +18,32 @@ bytes = "1"
 async-trait = "0.1"
 futures = "0.3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = [
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSObject",
+    "NSString",
+    "NSUUID",
+] }
+objc2-core-bluetooth = { version = "0.2", features = [
+    "CBAdvertisementData",
+    "CBAttribute",
+    "CBCentral",
+    "CBCharacteristic",
+    "CBManager",
+    "CBPeer",
+    "CBPeripheral",
+    "CBPeripheralManager",
+    "CBPeripheralManagerConstants",
+    "CBService",
+    "CBUUID",
+    "CBATTRequest",
+] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

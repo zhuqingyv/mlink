@@ -14,6 +14,7 @@ pub struct Scanner {
     app_uuid: String,
     seen: HashSet<String>,
     scan_interval: Duration,
+    room_hashes: Vec<[u8; 8]>,
 }
 
 impl Scanner {
@@ -23,6 +24,7 @@ impl Scanner {
             app_uuid: app_uuid.into(),
             seen: HashSet::new(),
             scan_interval: DEFAULT_SCAN_INTERVAL,
+            room_hashes: Vec::new(),
         }
     }
 
@@ -43,11 +45,36 @@ impl Scanner {
         self.seen.len()
     }
 
+    pub fn set_room_hashes(&mut self, hashes: Vec<[u8; 8]>) {
+        self.room_hashes = hashes;
+    }
+
+    pub fn room_hashes(&self) -> &[[u8; 8]] {
+        &self.room_hashes
+    }
+
+    fn metadata_matches_any_room(metadata: &[u8], hashes: &[[u8; 8]]) -> bool {
+        if hashes.is_empty() {
+            return true;
+        }
+        if metadata.len() < 8 {
+            return false;
+        }
+        hashes.iter().any(|h| {
+            metadata
+                .windows(8)
+                .any(|w| w == h.as_slice())
+        })
+    }
+
     pub async fn discover_once(&mut self) -> Result<Vec<DiscoveredPeer>> {
         let all = self.transport.discover().await?;
         let mut fresh = Vec::new();
         for peer in all {
             if peer.id == self.app_uuid {
+                continue;
+            }
+            if !Self::metadata_matches_any_room(&peer.metadata, &self.room_hashes) {
                 continue;
             }
             if self.seen.insert(peer.id.clone()) {
@@ -156,6 +183,15 @@ mod tests {
         }
     }
 
+    fn peer_with_meta(id: &str, metadata: Vec<u8>) -> DiscoveredPeer {
+        DiscoveredPeer {
+            id: id.into(),
+            name: format!("name-{id}"),
+            rssi: Some(-50),
+            metadata,
+        }
+    }
+
     #[tokio::test]
     async fn discover_once_returns_new_peers() {
         let t = ScriptedTransport::new(vec![vec![peer("a"), peer("b")]]);
@@ -242,5 +278,61 @@ mod tests {
         let s = Scanner::new(Box::new(t), "self-uuid")
             .with_interval(Duration::from_millis(42));
         assert_eq!(s.scan_interval(), Duration::from_millis(42));
+    }
+
+    #[tokio::test]
+    async fn no_room_hashes_means_no_filter() {
+        let t = ScriptedTransport::new(vec![vec![
+            peer_with_meta("a", vec![1, 2, 3]),
+            peer_with_meta("b", Vec::new()),
+        ]]);
+        let mut s = Scanner::new(Box::new(t), "self-uuid");
+        let got = s.discover_once().await.unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn room_hash_filter_keeps_matching_peers() {
+        let hash: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
+        let mut meta_with = vec![0x01, 0x02];
+        meta_with.extend_from_slice(&hash);
+        meta_with.push(0x99);
+        let t = ScriptedTransport::new(vec![vec![
+            peer_with_meta("a", meta_with),
+            peer_with_meta("b", vec![0, 0, 0, 0, 0, 0, 0, 0]),
+            peer_with_meta("c", Vec::new()),
+        ]]);
+        let mut s = Scanner::new(Box::new(t), "self-uuid");
+        s.set_room_hashes(vec![hash]);
+        let got = s.discover_once().await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "a");
+    }
+
+    #[tokio::test]
+    async fn room_hash_filter_matches_any_of_multiple() {
+        let h1: [u8; 8] = [1, 1, 1, 1, 1, 1, 1, 1];
+        let h2: [u8; 8] = [2, 2, 2, 2, 2, 2, 2, 2];
+        let t = ScriptedTransport::new(vec![vec![
+            peer_with_meta("a", h1.to_vec()),
+            peer_with_meta("b", h2.to_vec()),
+            peer_with_meta("c", vec![9, 9, 9, 9, 9, 9, 9, 9]),
+        ]]);
+        let mut s = Scanner::new(Box::new(t), "self-uuid");
+        s.set_room_hashes(vec![h1, h2]);
+        let mut got = s.discover_once().await.unwrap();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "a");
+        assert_eq!(got[1].id, "b");
+    }
+
+    #[tokio::test]
+    async fn set_room_hashes_stores_hashes() {
+        let t = ScriptedTransport::new(vec![]);
+        let mut s = Scanner::new(Box::new(t), "self-uuid");
+        let h: [u8; 8] = [1; 8];
+        s.set_room_hashes(vec![h]);
+        assert_eq!(s.room_hashes(), &[h]);
     }
 }
