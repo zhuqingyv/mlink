@@ -9,8 +9,22 @@
 
 #![cfg(target_os = "macos")]
 
+use std::ffi::{c_char, c_void, CString};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+
+// Minimal FFI into libdispatch. `dispatch_queue_create` returns a new serial
+// queue (when `attr` is null). We use it to create a dedicated queue for
+// CoreBluetooth delegate callbacks so they do not rely on the main thread's
+// dispatch/run loop — which does not run under tokio.
+//
+// The returned object is a dispatch_queue_t (an Obj-C object); we type it as
+// `*mut c_void` here since we only hand it back to Obj-C via `msg_send_id!`.
+// Not releasing the queue is deliberate: it lives as long as the peripheral
+// manager that uses it (i.e. the whole process in practice).
+extern "C" {
+    fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
+}
 
 use objc2::mutability::InteriorMutable;
 use objc2::rc::Retained;
@@ -153,10 +167,26 @@ impl MacPeripheral {
 
             let delegate_proto: &ProtocolObject<dyn CBPeripheralManagerDelegate> =
                 ProtocolObject::from_ref(&*delegate);
+            // Create a dedicated serial dispatch queue for delegate callbacks.
+            // Passing null here would schedule callbacks on the main queue,
+            // which never drains under tokio (the main thread is owned by the
+            // runtime and no dispatch/run loop is pumping it) — so didUpdateState
+            // et al. would never fire and `wait_for_powered_on` would hang.
+            let label = CString::new("com.mlink.peripheral")
+                .expect("static dispatch queue label contains no NUL");
+            let queue_ptr: *mut c_void =
+                unsafe { dispatch_queue_create(label.as_ptr(), std::ptr::null()) };
+            if queue_ptr.is_null() {
+                return Err(MlinkError::HandlerError(
+                    "dispatch_queue_create returned null".into(),
+                ));
+            }
+            let queue_obj: *mut AnyObject = queue_ptr as *mut AnyObject;
+
             eprintln!("[mlink:periph] creating CBPeripheralManager");
             let manager: Retained<CBPeripheralManager> = unsafe {
                 let alloc = CBPeripheralManager::alloc();
-                msg_send_id![alloc, initWithDelegate: delegate_proto, queue: std::ptr::null::<AnyObject>()]
+                msg_send_id![alloc, initWithDelegate: delegate_proto, queue: queue_obj]
             };
 
             let ad_dict = build_advertisement_data(&advertised_name)?;
