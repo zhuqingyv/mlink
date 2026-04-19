@@ -66,7 +66,9 @@ case "$OS" in
     Linux)
         case "$ARCH" in
             x86_64|amd64)  TARGET="x86_64-unknown-linux-gnu" ;;
-            aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+            aarch64|arm64)
+                err "Linux arm64 binary is not published. Build from source: cargo install --git https://github.com/${REPO} mlink-cli"
+                ;;
             *) err "unsupported Linux arch: $ARCH" ;;
         esac
         ;;
