@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use mlink_cli::{Cli, Commands, RoomAction, TrustAction};
@@ -177,8 +177,11 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
 
     // --- 2. Scan loop (background, only when a room is set) --------------
     // Scanner pushes newly-seen peers down `peer_rx`; auto-connect runs on the
-    // main task because `Node::connect_peer` needs `&mut Node`.
+    // main task because `Node::connect_peer` needs `&mut Node`. `unsee_tx`
+    // lets the main loop ask scanner to forget a peer id so it resurfaces on
+    // the next scan round (used when a dial fails and we want a retry).
     let (peer_tx, mut peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
+    let (unsee_tx, unsee_rx) = mpsc::channel::<String>(16);
     if room_hash_bytes.is_some() {
         let app_uuid = node.app_uuid().to_string();
         let hash = room_hash_bytes.expect("is_some checked above");
@@ -186,11 +189,17 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
         scan_transport.set_room_hash(hash);
         let mut scanner = Scanner::new(Box::new(scan_transport), app_uuid);
         scanner.set_room_hashes(vec![hash]);
+        scanner.set_unsee_channel(unsee_rx);
         tokio::spawn(async move {
             if let Err(e) = scanner.discover_loop(peer_tx).await {
                 eprintln!("[mlink] scanner error: {e}");
             }
         });
+    } else {
+        // No room → no scanner task → nothing will ever read `unsee_rx`.
+        // Drop it explicitly so the channel has no receiver and sends from
+        // the main loop fail-fast instead of filling the buffer.
+        drop(unsee_rx);
     }
 
     let mut events = node.subscribe();
@@ -199,9 +208,19 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
     // Track wire-level peer ids we have already engaged (as central or as
     // peripheral). When both Macs see each other simultaneously they'd
     // otherwise dial each other; the second dial kicks the first connection.
-    // We record any wire_id we've touched and skip duplicates.
-    use std::collections::HashSet;
+    // A peer is "engaged" while a connect attempt is in flight or the peer
+    // connected inbound first. Failure paths remove the entry so a retry can
+    // re-acquire the slot.
+    use std::collections::{HashMap, HashSet};
     let mut engaged_wire_ids: HashSet<String> = HashSet::new();
+    // Per-peer retry bookkeeping: how many connect attempts we've made so far.
+    // Reset once an attempt succeeds or the peer connects inbound.
+    const MAX_RETRIES: u8 = 3;
+    let mut attempts: HashMap<String, u8> = HashMap::new();
+    // Peers that connected inbound (peripheral path) before we finished
+    // dialling them. We must not then also dial — that would race and tear
+    // down the live inbound link.
+    let mut connected_inbound: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -214,40 +233,69 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                     Some(p) => p,
                     None => continue,
                 };
-                if engaged_wire_ids.contains(&peer.id) {
+                if connected_inbound.contains(&peer.id) {
                     eprintln!(
-                        "[mlink:conn] serve: skip dial {} — already engaged (incoming-first wins)",
+                        "[mlink:conn] serve: skip dial {} — already connected inbound",
                         peer.id
                     );
                     continue;
                 }
-                // Break symmetry: when two Macs see each other they'd both
-                // dial as central, and the second dial tears down the first
-                // link. The node with the smaller identifier dials; the other
-                // waits for the inbound connection on its peripheral.
-                let my_uuid = node.app_uuid();
-                if my_uuid > peer.id.as_str() {
+                if engaged_wire_ids.contains(&peer.id) {
                     eprintln!(
-                        "[mlink:conn] serve: skip dial {} — my_uuid {} > peer wire_id, waiting for inbound",
-                        peer.id, my_uuid
+                        "[mlink:conn] serve: skip dial {} — already engaged",
+                        peer.id
                     );
                     continue;
                 }
+                let attempt = attempts.entry(peer.id.clone()).or_insert(0);
+                if *attempt >= MAX_RETRIES {
+                    eprintln!(
+                        "[mlink:conn] serve: giving up on {} after {} attempts",
+                        peer.id, *attempt
+                    );
+                    continue;
+                }
+                *attempt += 1;
+                let attempt_no = *attempt;
                 engaged_wire_ids.insert(peer.id.clone());
-                println!("[mlink] discovered {} ({}) — connecting...", peer.name, peer.id);
-                eprintln!(
-                    "[mlink:conn] serve: dial as central wire_id={} (my_uuid {} < peer)",
-                    peer.id, my_uuid
+                println!(
+                    "[mlink] discovered {} ({}) — connecting (attempt {}/{})...",
+                    peer.name, peer.id, attempt_no, MAX_RETRIES
                 );
+                eprintln!(
+                    "[mlink:conn] serve: dial as central wire_id={} attempt={}",
+                    peer.id, attempt_no
+                );
+                let peer_wire_id = peer.id.clone();
                 match node.connect_peer(&mut connect_transport, &peer).await {
-                    Ok(peer_id) => println!("[mlink] + {peer_id}"),
+                    Ok(peer_id) => {
+                        println!("[mlink] + {peer_id}");
+                        attempts.remove(&peer_wire_id);
+                    }
                     Err(MlinkError::RoomMismatch { peer_id }) => {
                         println!("[mlink] dropped {peer_id}: different room");
+                        // Different room → no retry, pin the attempt counter
+                        // so we don't keep redialling a peer we just rejected.
+                        attempts.insert(peer_wire_id.clone(), MAX_RETRIES);
+                        engaged_wire_ids.remove(&peer_wire_id);
                     }
                     Err(e) => {
-                        eprintln!("[mlink] connect {} failed: {e}", peer.id);
-                        // Allow a future retry if the first attempt died.
-                        engaged_wire_ids.remove(&peer.id);
+                        eprintln!("[mlink] connect {} failed: {e}", peer_wire_id);
+                        engaged_wire_ids.remove(&peer_wire_id);
+                        // Random 1-3s backoff, then ask scanner to re-surface
+                        // this peer so the retry runs on the next scan tick.
+                        let delay = random_backoff();
+                        let unsee_tx = unsee_tx.clone();
+                        let wire_id = peer_wire_id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = unsee_tx.send(wire_id).await;
+                        });
+                        eprintln!(
+                            "[mlink:conn] serve: will retry {} in {}ms",
+                            peer_wire_id,
+                            delay.as_millis()
+                        );
                     }
                 }
             }
@@ -260,16 +308,26 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                 // Mark this wire as engaged so the scanner doesn't also dial
                 // them while we're finishing the peripheral-side handshake.
                 engaged_wire_ids.insert(wire_id.clone());
+                // Treat inbound-first as the authoritative direction: future
+                // scanner hits for the same wire_id will be skipped instead of
+                // dialled on top of the live link.
+                connected_inbound.insert(wire_id.clone());
                 println!("[mlink] incoming central {wire_id} — handshaking...");
                 eprintln!("[mlink:conn] serve: accept as peripheral wire_id={wire_id}");
                 match node.accept_incoming(conn, "ble", wire_id.clone()).await {
-                    Ok(peer_id) => println!("[mlink] + {peer_id} (incoming)"),
+                    Ok(peer_id) => {
+                        println!("[mlink] + {peer_id} (incoming)");
+                        attempts.remove(&wire_id);
+                    }
                     Err(MlinkError::RoomMismatch { peer_id }) => {
                         println!("[mlink] dropped incoming {peer_id}: different room");
+                        engaged_wire_ids.remove(&wire_id);
+                        connected_inbound.remove(&wire_id);
                     }
                     Err(e) => {
                         eprintln!("[mlink] accept {wire_id} failed: {e}");
                         engaged_wire_ids.remove(&wire_id);
+                        connected_inbound.remove(&wire_id);
                     }
                 }
             }
@@ -645,4 +703,31 @@ async fn cmd_doctor() -> Result<(), MlinkError> {
 #[allow(dead_code)]
 fn _reserved_mutex() -> Mutex<()> {
     Mutex::new(())
+}
+
+/// Random retry delay in the 1000-3000ms window. We derive the jitter from
+/// the current wall-clock nanoseconds to avoid pulling in a `rand` dependency
+/// for a single dice roll.
+fn random_backoff() -> std::time::Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // 1000..=3000 ms window → 2001 possible values.
+    let ms = 1000u64 + (nanos as u64 % 2001);
+    std::time::Duration::from_millis(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_backoff_stays_within_window() {
+        for _ in 0..50 {
+            let d = random_backoff();
+            assert!(d >= std::time::Duration::from_millis(1000));
+            assert!(d <= std::time::Duration::from_millis(3000));
+        }
+    }
 }

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::protocol::errors::Result;
@@ -15,6 +15,7 @@ pub struct Scanner {
     seen: HashSet<String>,
     scan_interval: Duration,
     room_hashes: Vec<[u8; 8]>,
+    unsee_rx: Option<Receiver<String>>,
 }
 
 impl Scanner {
@@ -25,7 +26,19 @@ impl Scanner {
             seen: HashSet::new(),
             scan_interval: DEFAULT_SCAN_INTERVAL,
             room_hashes: Vec::new(),
+            unsee_rx: None,
         }
+    }
+
+    /// Attach a channel on which callers can request that `id` be removed from
+    /// the "seen" set so the next scan round surfaces it again. Used by the
+    /// serve loop to retry peers whose connect attempt died.
+    pub fn set_unsee_channel(&mut self, rx: Receiver<String>) {
+        self.unsee_rx = Some(rx);
+    }
+
+    pub fn unsee(&mut self, id: &str) {
+        self.seen.remove(id);
     }
 
     pub fn with_interval(mut self, scan_interval: Duration) -> Self {
@@ -98,6 +111,13 @@ impl Scanner {
         let mut ticker = interval(self.scan_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
+            // Drain any pending unsee requests before the next scan so retried
+            // peers have a chance to re-surface on the upcoming round.
+            if let Some(rx) = self.unsee_rx.as_mut() {
+                while let Ok(id) = rx.try_recv() {
+                    self.seen.remove(&id);
+                }
+            }
             ticker.tick().await;
             if tx.is_closed() {
                 return Ok(());
@@ -354,6 +374,53 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].id, "a");
         assert_eq!(got[1].id, "b");
+    }
+
+    #[tokio::test]
+    async fn unsee_allows_peer_to_resurface() {
+        let t = ScriptedTransport::new(vec![vec![peer("a")], vec![peer("a")]]);
+        let mut s = Scanner::new(Box::new(t), "self-uuid");
+        let first = s.discover_once().await.unwrap();
+        assert_eq!(first.len(), 1);
+        // Without unsee, the second round returns nothing.
+        // With unsee("a"), "a" should re-surface as fresh.
+        s.unsee("a");
+        let second = s.discover_once().await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, "a");
+    }
+
+    #[tokio::test]
+    async fn discover_loop_consumes_unsee_channel() {
+        let t = ScriptedTransport::new(vec![
+            vec![peer("a")],
+            vec![peer("a")],
+            vec![peer("a")],
+        ]);
+        let mut s = Scanner::new(Box::new(t), "self-uuid")
+            .with_interval(Duration::from_millis(10));
+        let (unsee_tx, unsee_rx) = mpsc::channel::<String>(4);
+        s.set_unsee_channel(unsee_rx);
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = tokio::spawn(async move { s.discover_loop(tx).await });
+
+        // First round yields "a".
+        let p = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.id, "a");
+
+        // Ask scanner to forget "a" so it resurfaces on the next tick.
+        unsee_tx.send("a".into()).await.unwrap();
+        let p = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.id, "a");
+
+        drop(rx);
+        let _ = timeout(Duration::from_secs(1), handle).await.unwrap();
     }
 
     #[tokio::test]
