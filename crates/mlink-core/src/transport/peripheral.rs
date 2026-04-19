@@ -820,7 +820,11 @@ impl Connection for MacPeripheralConnection {
     }
 
     async fn close(&mut self) -> Result<()> {
-        self.peripheral.stop_advertising();
+        // Advertising lifetime is owned by MacPeripheral, not by any single
+        // inbound connection. Stopping it here would kill discoverability for
+        // every peer after the first mismatched/aborted handshake, so we only
+        // tear down per-connection state (no-op today; subscribe tracking is
+        // cleared by CoreBluetooth when the central disconnects).
         Ok(())
     }
 

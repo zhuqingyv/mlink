@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::protocol::codec;
 use crate::protocol::errors::{MlinkError, Result};
@@ -8,6 +9,12 @@ use crate::protocol::types::{
     encode_flags, Frame, Handshake, MessageType, MAGIC, PROTOCOL_VERSION,
 };
 use crate::transport::Connection;
+
+/// Per-direction ceiling on the handshake. A slow or silent peer must never
+/// be allowed to freeze the caller's event loop (e.g. `cmd_serve`'s main
+/// select!) — on timeout we bail with a `HandlerError` the caller can map to
+/// a retry.
+pub const HANDSHAKE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -81,9 +88,23 @@ pub async fn perform_handshake(
         length,
         payload,
     };
-    conn.write(&encode_frame(&frame)).await?;
+    tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, conn.write(&encode_frame(&frame)))
+        .await
+        .map_err(|_| {
+            MlinkError::HandlerError(format!(
+                "handshake write timed out after {:?}",
+                HANDSHAKE_IO_TIMEOUT
+            ))
+        })??;
 
-    let bytes = conn.read().await?;
+    let bytes = tokio::time::timeout(HANDSHAKE_IO_TIMEOUT, conn.read())
+        .await
+        .map_err(|_| {
+            MlinkError::HandlerError(format!(
+                "handshake read timed out after {:?}",
+                HANDSHAKE_IO_TIMEOUT
+            ))
+        })??;
     let recv_frame = decode_frame(&bytes)?;
     let (_, _, msg_type) = crate::protocol::types::decode_flags(recv_frame.flags);
     if msg_type != MessageType::Handshake {
@@ -125,6 +146,46 @@ mod tests {
         // Same uuid is pathological but must be deterministic.
         let r = negotiate_role("same", "same");
         assert_eq!(r, Role::Peripheral);
+    }
+
+    #[tokio::test]
+    async fn perform_handshake_times_out_on_silent_peer() {
+        // A peer that never sends back a handshake must not freeze the caller;
+        // the write succeeds, the read hangs, and the per-direction timeout
+        // must convert that into a HandlerError within a bounded window.
+        struct SilentConn;
+        #[async_trait]
+        impl Connection for SilentConn {
+            async fn read(&mut self) -> Result<Vec<u8>> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            async fn write(&mut self, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn peer_id(&self) -> &str {
+                "silent"
+            }
+        }
+
+        let mut conn = SilentConn;
+        // Pause tokio's clock so the 10s constant doesn't actually wait; we
+        // advance virtual time instead and still exercise the real timeout
+        // logic in perform_handshake.
+        tokio::time::pause();
+        let handle = tokio::spawn(async move {
+            perform_handshake(&mut conn, &sample_handshake("me")).await
+        });
+        // Step past the read ceiling.
+        tokio::time::advance(HANDSHAKE_IO_TIMEOUT + Duration::from_millis(1)).await;
+        let err = handle.await.expect("join").unwrap_err();
+        assert!(
+            matches!(err, MlinkError::HandlerError(ref msg) if msg.contains("timed out")),
+            "expected HandlerError(... timed out ...), got {err:?}"
+        );
     }
 
     struct MockConn {

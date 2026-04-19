@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use mlink_cli::{Cli, Commands, RoomAction, TrustAction};
@@ -267,7 +267,19 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                     peer.id, attempt_no
                 );
                 let peer_wire_id = peer.id.clone();
-                match node.connect_peer(&mut connect_transport, &peer).await {
+                let dial_result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    node.connect_peer(&mut connect_transport, &peer),
+                )
+                .await;
+                let dial_result = match dial_result {
+                    Ok(inner) => inner,
+                    Err(_) => Err(MlinkError::HandlerError(format!(
+                        "connect to {} timed out after {:?}",
+                        peer_wire_id, CONNECT_TIMEOUT
+                    ))),
+                };
+                match dial_result {
                     Ok(peer_id) => {
                         println!("[mlink] + {peer_id}");
                         attempts.remove(&peer_wire_id);
@@ -314,7 +326,19 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                 connected_inbound.insert(wire_id.clone());
                 println!("[mlink] incoming central {wire_id} — handshaking...");
                 eprintln!("[mlink:conn] serve: accept as peripheral wire_id={wire_id}");
-                match node.accept_incoming(conn, "ble", wire_id.clone()).await {
+                let accept_result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    node.accept_incoming(conn, "ble", wire_id.clone()),
+                )
+                .await;
+                let accept_result = match accept_result {
+                    Ok(inner) => inner,
+                    Err(_) => Err(MlinkError::HandlerError(format!(
+                        "accept from {} timed out after {:?}",
+                        wire_id, CONNECT_TIMEOUT
+                    ))),
+                };
+                match accept_result {
                     Ok(peer_id) => {
                         println!("[mlink] + {peer_id} (incoming)");
                         attempts.remove(&wire_id);
@@ -704,6 +728,13 @@ async fn cmd_doctor() -> Result<(), MlinkError> {
 fn _reserved_mutex() -> Mutex<()> {
     Mutex::new(())
 }
+
+/// Outer timeout for connect_peer / accept_incoming. Picked larger than the
+/// 10s handshake IO ceiling in `perform_handshake` so an honest-but-slow peer
+/// still completes, but small enough that a silent peer can't freeze the
+/// main `select!` loop. If this fires, the dial/accept path unwinds via a
+/// `HandlerError` and the normal retry-with-backoff path runs.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Random retry delay in the 1000-3000ms window. We derive the jitter from
 /// the current wall-clock nanoseconds to avoid pulling in a `rand` dependency
