@@ -136,7 +136,15 @@ impl Transport for BleTransport {
     async fn discover(&mut self) -> Result<Vec<DiscoveredPeer>> {
         let scan_duration = self.scan_duration;
         let adapter = self.ensure_adapter().await?;
-        let filter = ScanFilter { services: vec![] };
+        // Filter at the CoreBluetooth layer by service UUID. On macOS the
+        // peripheral's advertised service UUID often ends up in the overflow
+        // area, which means `props.services` will be empty even though the
+        // device genuinely advertises MLINK_SERVICE_UUID. Passing the UUID
+        // into ScanFilter lets CoreBluetooth match against the overflow area
+        // directly, so we still surface those peripherals.
+        let filter = ScanFilter {
+            services: vec![MLINK_SERVICE_UUID],
+        };
         adapter.start_scan(filter).await?;
         tokio::time::sleep(scan_duration).await;
         let peripherals = adapter.peripherals().await?;
@@ -146,16 +154,34 @@ impl Transport for BleTransport {
         for p in peripherals {
             let props = match p.properties().await? {
                 Some(p) => p,
-                None => continue,
+                None => {
+                    eprintln!("[mlink:debug] peripheral {} has no properties", p.id());
+                    continue;
+                }
             };
-            let raw_name = match props.local_name {
-                Some(n) => n,
-                None => continue,
-            };
+            let raw_name = props.local_name.clone().unwrap_or_default();
+            // Try to lift a room hash out of the local name; if that fails,
+            // fall back to manufacturer_data so the peer still shows up and
+            // the caller can decide what to do with it.
             let (name, metadata) = match parse_room_hash_from_name(&raw_name) {
                 Some((base, hash)) => (base, hash.to_vec()),
-                None => continue,
+                None => {
+                    let manuf_bytes: Vec<u8> = props
+                        .manufacturer_data
+                        .values()
+                        .flat_map(|v| v.iter().copied())
+                        .collect();
+                    (raw_name.clone(), manuf_bytes)
+                }
             };
+            eprintln!(
+                "[mlink:debug] discovered peer id={} name={:?} rssi={:?} services={:?} metadata_len={}",
+                p.id(),
+                raw_name,
+                props.rssi,
+                props.services,
+                metadata.len()
+            );
             out.push(DiscoveredPeer {
                 id: p.id().to_string(),
                 name,
