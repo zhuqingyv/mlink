@@ -15,6 +15,10 @@ pub struct Cli {
     /// 6-digit room code. Omit to generate a new one. Ignored if a subcommand is given.
     pub code: Option<String>,
 
+    /// Link-layer transport: "ble" (default) or "tcp".
+    #[arg(long, default_value = "ble", global = true)]
+    pub transport: String,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

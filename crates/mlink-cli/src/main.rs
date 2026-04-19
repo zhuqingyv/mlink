@@ -13,6 +13,7 @@ use mlink_core::core::security::TrustStore;
 use mlink_core::protocol::errors::MlinkError;
 use mlink_core::protocol::types::MessageType;
 use mlink_core::transport::ble::BleTransport;
+use mlink_core::transport::tcp::TcpTransport;
 use mlink_core::transport::{Connection, DiscoveredPeer, Transport};
 use tokio::signal;
 use tokio::sync::{mpsc, Mutex};
@@ -33,12 +34,31 @@ async fn main() -> ExitCode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportKind {
+    Ble,
+    Tcp,
+}
+
+impl TransportKind {
+    fn parse(s: &str) -> Result<Self, MlinkError> {
+        match s {
+            "ble" => Ok(TransportKind::Ble),
+            "tcp" => Ok(TransportKind::Tcp),
+            other => Err(MlinkError::HandlerError(format!(
+                "unknown --transport {other:?}: expected \"ble\" or \"tcp\""
+            ))),
+        }
+    }
+}
+
 async fn run(cli: Cli) -> Result<(), MlinkError> {
+    let kind = TransportKind::parse(&cli.transport)?;
     match cli.command {
-        Some(Commands::Serve) => cmd_serve(None).await,
-        Some(Commands::Room { action }) => cmd_room(action).await,
+        Some(Commands::Serve) => cmd_serve(None, kind).await,
+        Some(Commands::Room { action }) => cmd_room(action, kind).await,
         Some(Commands::Send { code, file, message }) => cmd_send_room(code, file, message).await,
-        Some(Commands::Listen) => cmd_listen().await,
+        Some(Commands::Listen) => cmd_listen(kind).await,
 
         Some(Commands::Scan) => cmd_scan().await,
         Some(Commands::Connect { peer_id }) => cmd_connect(peer_id).await,
@@ -63,7 +83,7 @@ async fn run(cli: Cli) -> Result<(), MlinkError> {
                     c
                 }
             };
-            cmd_serve(Some(code)).await
+            cmd_serve(Some(code), kind).await
         }
     }
 }
@@ -94,7 +114,7 @@ async fn build_node() -> Result<Node, MlinkError> {
 /// Long-running loop: advertise, scan, auto-connect, print incoming frames.
 /// If `room_code` is set both the peripheral advertisement and the scan filter
 /// are tagged with its hash so the two sides can rendezvous on the same room.
-async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
+async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(), MlinkError> {
     let mut node = build_node().await?;
     let local_name = node.config().name.clone();
     let room_hash_bytes: Option<[u8; 8]> = room_code.as_deref().map(room_hash);
@@ -108,71 +128,103 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
     match &room_code {
         Some(code) => {
             println!("[mlink] room: {code}");
-            println!("[mlink] serving as {} — waiting for peers...", node.app_uuid());
+            println!(
+                "[mlink] serving as {} via {} — waiting for peers...",
+                node.app_uuid(),
+                transport_label(kind)
+            );
         }
-        None => println!("[mlink] serving as {}", node.app_uuid()),
+        None => println!(
+            "[mlink] serving as {} via {}",
+            node.app_uuid(),
+            transport_label(kind)
+        ),
     }
 
-    // --- 1. Peripheral advertisement (background) ------------------------
-    // Advertises the mlink service and forwards every accepted central's
+    // --- 1. Peripheral advertisement / TCP listener (background) ---------
+    // Advertises the mlink service and forwards every accepted peer's
     // connection back to the main loop so it can drive the handshake on the
     // Node. Without this, a central that dials us gets frames routed into
-    // a dead `MacPeripheralConnection` and the handshake stalls forever.
+    // a dead connection and the handshake stalls forever.
     let (accepted_tx, mut accepted_rx) = mpsc::channel::<Box<dyn Connection>>(4);
-    {
-        let mut listen_transport = BleTransport::new();
-        listen_transport.set_local_name(local_name.clone());
-        if let Some(h) = room_hash_bytes {
-            listen_transport.set_room_hash(h);
-        }
-        let local_name_for_task = local_name.clone();
-        tokio::spawn(async move {
-            #[cfg(target_os = "macos")]
-            {
-                let peripheral = match listen_transport.start_peripheral().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("[mlink] peripheral advertisement error: {e}");
-                        print_bluetooth_permission_hint();
-                        return;
-                    }
-                };
-                loop {
-                    let central_id = match peripheral.wait_for_central().await {
-                        Ok(id) => id,
+    match kind {
+        TransportKind::Ble => {
+            let mut listen_transport = BleTransport::new();
+            listen_transport.set_local_name(local_name.clone());
+            if let Some(h) = room_hash_bytes {
+                listen_transport.set_room_hash(h);
+            }
+            let local_name_for_task = local_name.clone();
+            tokio::spawn(async move {
+                #[cfg(target_os = "macos")]
+                {
+                    let peripheral = match listen_transport.start_peripheral().await {
+                        Ok(p) => p,
                         Err(e) => {
-                            eprintln!("[mlink] peripheral accept error: {e}");
+                            eprintln!("[mlink] peripheral advertisement error: {e}");
+                            print_bluetooth_permission_hint();
                             return;
                         }
                     };
-                    let conn: Box<dyn Connection> = Box::new(
-                        mlink_core::transport::peripheral::MacPeripheralConnection::new(
-                            central_id.clone(),
-                            peripheral.clone(),
-                        ),
-                    );
-                    if accepted_tx.send(conn).await.is_err() {
-                        return;
-                    }
-                    eprintln!(
-                        "[mlink:debug] peripheral accepted central {central_id} (as {local_name_for_task})"
-                    );
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (local_name_for_task, accepted_tx);
-                match listen_transport.listen().await {
-                    Ok(_conn) => {
-                        std::future::pending::<()>().await;
-                    }
-                    Err(e) => {
-                        eprintln!("[mlink] peripheral advertisement error: {e}");
-                        print_bluetooth_permission_hint();
+                    loop {
+                        let central_id = match peripheral.wait_for_central().await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("[mlink] peripheral accept error: {e}");
+                                return;
+                            }
+                        };
+                        let conn: Box<dyn Connection> = Box::new(
+                            mlink_core::transport::peripheral::MacPeripheralConnection::new(
+                                central_id.clone(),
+                                peripheral.clone(),
+                            ),
+                        );
+                        if accepted_tx.send(conn).await.is_err() {
+                            return;
+                        }
+                        eprintln!(
+                            "[mlink:debug] peripheral accepted central {central_id} (as {local_name_for_task})"
+                        );
                     }
                 }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (local_name_for_task, accepted_tx);
+                    match listen_transport.listen().await {
+                        Ok(_conn) => {
+                            std::future::pending::<()>().await;
+                        }
+                        Err(e) => {
+                            eprintln!("[mlink] peripheral advertisement error: {e}");
+                            print_bluetooth_permission_hint();
+                        }
+                    }
+                }
+            });
+        }
+        TransportKind::Tcp => {
+            let mut listen_transport = TcpTransport::new();
+            listen_transport.set_local_name(local_name.clone());
+            if let Some(h) = room_hash_bytes {
+                listen_transport.set_room_hash(h);
             }
-        });
+            tokio::spawn(async move {
+                loop {
+                    match listen_transport.listen().await {
+                        Ok(conn) => {
+                            if accepted_tx.send(conn).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[mlink] tcp accept error: {e}");
+                            return;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // --- 2. Scan loop (background, only when a room is set) --------------
@@ -185,9 +237,19 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
     if room_hash_bytes.is_some() {
         let app_uuid = node.app_uuid().to_string();
         let hash = room_hash_bytes.expect("is_some checked above");
-        let mut scan_transport = BleTransport::new();
-        scan_transport.set_room_hash(hash);
-        let mut scanner = Scanner::new(Box::new(scan_transport), app_uuid);
+        let scan_transport: Box<dyn Transport> = match kind {
+            TransportKind::Ble => {
+                let mut t = BleTransport::new();
+                t.set_room_hash(hash);
+                Box::new(t)
+            }
+            TransportKind::Tcp => {
+                let mut t = TcpTransport::new();
+                t.set_room_hash(hash);
+                Box::new(t)
+            }
+        };
+        let mut scanner = Scanner::new(scan_transport, app_uuid);
         scanner.set_room_hashes(vec![hash]);
         scanner.set_unsee_channel(unsee_rx);
         tokio::spawn(async move {
@@ -204,7 +266,10 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
 
     let mut events = node.subscribe();
     // Connecting transport reused across auto-connect attempts.
-    let mut connect_transport = BleTransport::new();
+    let mut connect_transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => Box::new(BleTransport::new()),
+        TransportKind::Tcp => Box::new(TcpTransport::new()),
+    };
     // Track wire-level peer ids we have already engaged (as central or as
     // peripheral). When both Macs see each other simultaneously they'd
     // otherwise dial each other; the second dial kicks the first connection.
@@ -269,7 +334,7 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                 let peer_wire_id = peer.id.clone();
                 let dial_result = tokio::time::timeout(
                     CONNECT_TIMEOUT,
-                    node.connect_peer(&mut connect_transport, &peer),
+                    node.connect_peer(connect_transport.as_mut(), &peer),
                 )
                 .await;
                 let dial_result = match dial_result {
@@ -328,7 +393,7 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                 eprintln!("[mlink:conn] serve: accept as peripheral wire_id={wire_id}");
                 let accept_result = tokio::time::timeout(
                     CONNECT_TIMEOUT,
-                    node.accept_incoming(conn, "ble", wire_id.clone()),
+                    node.accept_incoming(conn, transport_label(kind), wire_id.clone()),
                 )
                 .await;
                 let accept_result = match accept_result {
@@ -379,19 +444,19 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
     Ok(())
 }
 
-async fn cmd_room(action: RoomAction) -> Result<(), MlinkError> {
+async fn cmd_room(action: RoomAction, kind: TransportKind) -> Result<(), MlinkError> {
     match action {
         RoomAction::New => {
             let code = generate_room_code();
             println!("[mlink] room created: {code}");
             println!("[mlink] share this code with other devices, then run:");
             println!("        mlink room join {code}");
-            cmd_serve(Some(code)).await
+            cmd_serve(Some(code), kind).await
         }
         RoomAction::Join { code } => {
             validate_room_code(&code)?;
             println!("[mlink] joining room {code}");
-            cmd_serve(Some(code)).await
+            cmd_serve(Some(code), kind).await
         }
         RoomAction::Leave { code } => {
             validate_room_code(&code)?;
@@ -559,11 +624,18 @@ fn unsafe_clone_node(_n: &Node) -> Node {
     )
 }
 
-async fn cmd_listen() -> Result<(), MlinkError> {
+async fn cmd_listen(kind: TransportKind) -> Result<(), MlinkError> {
     // Listen = serve without joining any particular room; just print every
     // MESSAGE frame we receive across any peer the daemon has accepted.
     println!("[mlink] listen: running serve loop, Ctrl+C to quit");
-    cmd_serve(None).await
+    cmd_serve(None, kind).await
+}
+
+fn transport_label(kind: TransportKind) -> &'static str {
+    match kind {
+        TransportKind::Ble => "ble",
+        TransportKind::Tcp => "tcp",
+    }
 }
 
 // ---- legacy peer-id commands ------------------------------------------------
