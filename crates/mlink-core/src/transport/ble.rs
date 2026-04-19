@@ -194,20 +194,40 @@ impl Transport for BleTransport {
 
     async fn connect(&mut self, peer: &DiscoveredPeer) -> Result<Box<dyn Connection>> {
         let peer_id = peer.id.clone();
+        eprintln!("[mlink:conn] ble.connect start peer_id={peer_id} name={:?}", peer.name);
         let adapter = self.ensure_adapter().await?;
         let peripheral = find_peripheral(adapter, &peer_id).await?;
 
-        if !peripheral.is_connected().await? {
-            peripheral.connect().await?;
+        let was_connected = peripheral.is_connected().await.unwrap_or(false);
+        eprintln!("[mlink:conn] ble.connect is_connected(before)={was_connected} peer={peer_id}");
+        if !was_connected {
+            eprintln!("[mlink:conn] ble.connect -> peripheral.connect() peer={peer_id}");
+            if let Err(e) = peripheral.connect().await {
+                eprintln!("[mlink:conn] ble.connect peripheral.connect() FAILED peer={peer_id}: {e}");
+                return Err(e.into());
+            }
+            eprintln!("[mlink:conn] ble.connect peripheral.connect() OK peer={peer_id}");
         }
-        peripheral.discover_services().await?;
+        eprintln!("[mlink:conn] ble.connect -> discover_services() peer={peer_id}");
+        if let Err(e) = peripheral.discover_services().await {
+            eprintln!("[mlink:conn] ble.connect discover_services FAILED peer={peer_id}: {e}");
+            return Err(e.into());
+        }
 
         let chars = peripheral.characteristics();
+        eprintln!(
+            "[mlink:conn] ble.connect discovered {} characteristic(s) peer={peer_id}",
+            chars.len()
+        );
+        for c in &chars {
+            eprintln!("[mlink:conn]   char uuid={} service={}", c.uuid, c.service_uuid);
+        }
         let tx_char = chars
             .iter()
             .find(|c| c.uuid == TX_CHAR_UUID)
             .cloned()
             .ok_or_else(|| {
+                eprintln!("[mlink:conn] ble.connect TX char MISSING peer={peer_id}");
                 MlinkError::HandlerError(format!("TX characteristic missing on {peer_id}"))
             })?;
         let rx_char = chars
@@ -215,10 +235,16 @@ impl Transport for BleTransport {
             .find(|c| c.uuid == RX_CHAR_UUID)
             .cloned()
             .ok_or_else(|| {
+                eprintln!("[mlink:conn] ble.connect RX char MISSING peer={peer_id}");
                 MlinkError::HandlerError(format!("RX characteristic missing on {peer_id}"))
             })?;
+        eprintln!("[mlink:conn] ble.connect TX+RX chars found peer={peer_id}");
 
-        peripheral.subscribe(&rx_char).await?;
+        if let Err(e) = peripheral.subscribe(&rx_char).await {
+            eprintln!("[mlink:conn] ble.connect subscribe(RX) FAILED peer={peer_id}: {e}");
+            return Err(e.into());
+        }
+        eprintln!("[mlink:conn] ble.connect subscribe(RX) OK peer={peer_id}");
         let notifications = peripheral.notifications().await?;
 
         Ok(Box::new(BleConnection {

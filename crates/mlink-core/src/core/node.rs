@@ -189,14 +189,23 @@ impl Node {
         transport: &mut dyn Transport,
         discovered: &DiscoveredPeer,
     ) -> Result<String> {
+        eprintln!(
+            "[mlink:conn] node.connect_peer ENTER peer_id={} name={:?}",
+            discovered.id, discovered.name
+        );
         self.set_peer_state(&discovered.id, NodeState::Connecting).await;
 
         let _role = negotiate_role(&self.app_uuid, &discovered.id);
+        eprintln!(
+            "[mlink:conn] node.connect_peer role (by wire-id, pre-handshake)={:?} my_app_uuid={} peer_wire_id={}",
+            _role, self.app_uuid, discovered.id
+        );
 
         let mut conn = transport.connect(discovered).await.map_err(|e| {
-            // If connect fails we don't have a peer state yet to roll back
+            eprintln!("[mlink:conn] node.connect_peer transport.connect FAILED peer={}: {e}", discovered.id);
             e
         })?;
+        eprintln!("[mlink:conn] node.connect_peer transport.connect OK peer={}", discovered.id);
 
         let local_hs = Handshake {
             app_uuid: self.app_uuid.clone(),
@@ -209,15 +218,44 @@ impl Node {
             room_hash: self.room_hash,
         };
 
-        let peer_hs = perform_handshake(conn.as_mut(), &local_hs).await?;
+        eprintln!(
+            "[mlink:conn] node.connect_peer -> perform_handshake peer={} room_hash={:?}",
+            discovered.id, self.room_hash
+        );
+        let peer_hs = match perform_handshake(conn.as_mut(), &local_hs).await {
+            Ok(hs) => {
+                eprintln!(
+                    "[mlink:conn] node.connect_peer handshake OK peer_wire={} peer_app={} peer_room={:?}",
+                    discovered.id, hs.app_uuid, hs.room_hash
+                );
+                hs
+            }
+            Err(e) => {
+                eprintln!(
+                    "[mlink:conn] node.connect_peer handshake FAILED peer={}: {e}",
+                    discovered.id
+                );
+                let _ = conn.close().await;
+                return Err(e);
+            }
+        };
 
         // Room membership check: if we care about a specific room, the peer
         // must advertise the same hash. Close and bail on mismatch so we
         // don't surface a peer from a foreign room.
         if let Some(local) = self.room_hash {
             match peer_hs.room_hash {
-                Some(peer) if peer == local => {}
-                _ => {
+                Some(peer) if peer == local => {
+                    eprintln!(
+                        "[mlink:conn] node.connect_peer room match OK peer={}",
+                        discovered.id
+                    );
+                }
+                other => {
+                    eprintln!(
+                        "[mlink:conn] node.connect_peer ROOM MISMATCH peer={} local={:?} peer_claims={:?}",
+                        discovered.id, local, other
+                    );
                     let _ = conn.close().await;
                     return Err(MlinkError::RoomMismatch {
                         peer_id: discovered.id.clone(),
@@ -265,6 +303,10 @@ impl Node {
         transport_id: &str,
         fallback_name: String,
     ) -> Result<String> {
+        let wire_id = conn.peer_id().to_string();
+        eprintln!(
+            "[mlink:conn] node.accept_incoming ENTER wire_id={wire_id} transport={transport_id}"
+        );
         let local_hs = Handshake {
             app_uuid: self.app_uuid.clone(),
             version: PROTOCOL_VERSION,
@@ -276,9 +318,22 @@ impl Node {
             room_hash: self.room_hash,
         };
 
+        eprintln!(
+            "[mlink:conn] node.accept_incoming -> perform_handshake wire={wire_id} room_hash={:?}",
+            self.room_hash
+        );
         let peer_hs = match perform_handshake(conn.as_mut(), &local_hs).await {
-            Ok(hs) => hs,
+            Ok(hs) => {
+                eprintln!(
+                    "[mlink:conn] node.accept_incoming handshake OK wire={wire_id} peer_app={} peer_room={:?}",
+                    hs.app_uuid, hs.room_hash
+                );
+                hs
+            }
             Err(e) => {
+                eprintln!(
+                    "[mlink:conn] node.accept_incoming handshake FAILED wire={wire_id}: {e}"
+                );
                 let _ = conn.close().await;
                 return Err(e);
             }
@@ -286,8 +341,16 @@ impl Node {
 
         if let Some(local) = self.room_hash {
             match peer_hs.room_hash {
-                Some(peer) if peer == local => {}
-                _ => {
+                Some(peer) if peer == local => {
+                    eprintln!(
+                        "[mlink:conn] node.accept_incoming room match OK wire={wire_id}"
+                    );
+                }
+                other => {
+                    eprintln!(
+                        "[mlink:conn] node.accept_incoming ROOM MISMATCH wire={wire_id} local={:?} peer_claims={:?}",
+                        local, other
+                    );
                     let wire_peer_id = conn.peer_id().to_string();
                     let _ = conn.close().await;
                     return Err(MlinkError::RoomMismatch {

@@ -196,6 +196,12 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
     let mut events = node.subscribe();
     // Connecting transport reused across auto-connect attempts.
     let mut connect_transport = BleTransport::new();
+    // Track wire-level peer ids we have already engaged (as central or as
+    // peripheral). When both Macs see each other simultaneously they'd
+    // otherwise dial each other; the second dial kicks the first connection.
+    // We record any wire_id we've touched and skip duplicates.
+    use std::collections::HashSet;
+    let mut engaged_wire_ids: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -208,13 +214,26 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                     Some(p) => p,
                     None => continue,
                 };
+                if engaged_wire_ids.contains(&peer.id) {
+                    eprintln!(
+                        "[mlink:conn] serve: skip dial {} — already engaged (incoming-first wins)",
+                        peer.id
+                    );
+                    continue;
+                }
+                engaged_wire_ids.insert(peer.id.clone());
                 println!("[mlink] discovered {} ({}) — connecting...", peer.name, peer.id);
+                eprintln!("[mlink:conn] serve: dial as central wire_id={}", peer.id);
                 match node.connect_peer(&mut connect_transport, &peer).await {
                     Ok(peer_id) => println!("[mlink] + {peer_id}"),
                     Err(MlinkError::RoomMismatch { peer_id }) => {
                         println!("[mlink] dropped {peer_id}: different room");
                     }
-                    Err(e) => eprintln!("[mlink] connect {} failed: {e}", peer.id),
+                    Err(e) => {
+                        eprintln!("[mlink] connect {} failed: {e}", peer.id);
+                        // Allow a future retry if the first attempt died.
+                        engaged_wire_ids.remove(&peer.id);
+                    }
                 }
             }
             maybe_conn = accepted_rx.recv() => {
@@ -223,13 +242,20 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                     None => continue,
                 };
                 let wire_id = conn.peer_id().to_string();
+                // Mark this wire as engaged so the scanner doesn't also dial
+                // them while we're finishing the peripheral-side handshake.
+                engaged_wire_ids.insert(wire_id.clone());
                 println!("[mlink] incoming central {wire_id} — handshaking...");
+                eprintln!("[mlink:conn] serve: accept as peripheral wire_id={wire_id}");
                 match node.accept_incoming(conn, "ble", wire_id.clone()).await {
                     Ok(peer_id) => println!("[mlink] + {peer_id} (incoming)"),
                     Err(MlinkError::RoomMismatch { peer_id }) => {
                         println!("[mlink] dropped incoming {peer_id}: different room");
                     }
-                    Err(e) => eprintln!("[mlink] accept {wire_id} failed: {e}"),
+                    Err(e) => {
+                        eprintln!("[mlink] accept {wire_id} failed: {e}");
+                        engaged_wire_ids.remove(&wire_id);
+                    }
                 }
             }
             ev = events.recv() => {
