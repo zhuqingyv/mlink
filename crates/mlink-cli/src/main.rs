@@ -221,9 +221,24 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                     );
                     continue;
                 }
+                // Break symmetry: when two Macs see each other they'd both
+                // dial as central, and the second dial tears down the first
+                // link. The node with the smaller identifier dials; the other
+                // waits for the inbound connection on its peripheral.
+                let my_uuid = node.app_uuid();
+                if my_uuid > peer.id.as_str() {
+                    eprintln!(
+                        "[mlink:conn] serve: skip dial {} — my_uuid {} > peer wire_id, waiting for inbound",
+                        peer.id, my_uuid
+                    );
+                    continue;
+                }
                 engaged_wire_ids.insert(peer.id.clone());
                 println!("[mlink] discovered {} ({}) — connecting...", peer.name, peer.id);
-                eprintln!("[mlink:conn] serve: dial as central wire_id={}", peer.id);
+                eprintln!(
+                    "[mlink:conn] serve: dial as central wire_id={} (my_uuid {} < peer)",
+                    peer.id, my_uuid
+                );
                 match node.connect_peer(&mut connect_transport, &peer).await {
                     Ok(peer_id) => println!("[mlink] + {peer_id}"),
                     Err(MlinkError::RoomMismatch { peer_id }) => {
