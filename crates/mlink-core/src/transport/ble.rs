@@ -84,6 +84,20 @@ impl BleTransport {
         self.room_hash.as_ref()
     }
 
+    /// Start peripheral advertising and return the `MacPeripheral` handle so
+    /// the caller can loop on `wait_for_central()` to accept multiple centrals.
+    /// `listen()` only returns a single `Connection` and is kept for the
+    /// single-central path; callers that need multi-central acceptance should
+    /// use this method instead.
+    #[cfg(target_os = "macos")]
+    pub async fn start_peripheral(
+        &mut self,
+    ) -> Result<std::sync::Arc<super::peripheral::MacPeripheral>> {
+        use super::peripheral::MacPeripheral;
+        let peripheral = MacPeripheral::start(self.local_name.clone(), self.room_hash).await?;
+        Ok(std::sync::Arc::new(peripheral))
+    }
+
     async fn ensure_adapter(&mut self) -> Result<&Adapter> {
         if self.adapter.is_none() {
             let manager = Manager::new().await?;
@@ -139,13 +153,23 @@ impl Transport for BleTransport {
             if !props.services.contains(&MLINK_SERVICE_UUID) {
                 continue;
             }
-            let name = props.local_name.unwrap_or_else(|| p.id().to_string());
-            let metadata = props
-                .manufacturer_data
-                .values()
-                .next()
-                .cloned()
-                .unwrap_or_default();
+            let raw_name = props.local_name.unwrap_or_else(|| p.id().to_string());
+            // macOS can't set manufacturer_data in peripheral-role advertisements,
+            // so peripherals encode the room hash into the advertised name as
+            // `<name>#<16 hex>`. Parse it back out so Scanner can filter by room.
+            // Fall back to manufacturer_data for iOS/Linux peripherals.
+            let (name, metadata) = match parse_room_hash_from_name(&raw_name) {
+                Some((base, hash)) => (base, hash.to_vec()),
+                None => {
+                    let md = props
+                        .manufacturer_data
+                        .values()
+                        .next()
+                        .cloned()
+                        .unwrap_or_default();
+                    (raw_name, md)
+                }
+            };
             out.push(DiscoveredPeer {
                 id: p.id().to_string(),
                 name,
@@ -220,6 +244,21 @@ impl Transport for BleTransport {
     fn mtu(&self) -> usize {
         self.negotiated_mtu
     }
+}
+
+/// Parse `<name>#<16 lowercase-hex>` into `(base_name, [u8; 8])`. Returns
+/// `None` if the suffix isn't present or isn't a valid 8-byte hex string.
+fn parse_room_hash_from_name(name: &str) -> Option<(String, [u8; 8])> {
+    let hash_pos = name.rfind('#')?;
+    let hex_str = &name[hash_pos + 1..];
+    if hex_str.len() != 16 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 8];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some((name[..hash_pos].to_string(), out))
 }
 
 async fn find_peripheral(adapter: &Adapter, peer_id: &str) -> Result<Peripheral> {
@@ -364,5 +403,36 @@ mod tests {
         let mut t = BleTransport::new();
         t.set_local_name("mlink-node-a");
         assert_eq!(t.local_name, "mlink-node-a");
+    }
+
+    #[test]
+    fn parse_room_hash_roundtrips_valid_suffix() {
+        let hash: [u8; 8] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11];
+        let name = "mlink-node#aabbccddeeff0011";
+        let (base, got) = parse_room_hash_from_name(name).expect("should parse");
+        assert_eq!(base, "mlink-node");
+        assert_eq!(got, hash);
+    }
+
+    #[test]
+    fn parse_room_hash_returns_none_without_suffix() {
+        assert!(parse_room_hash_from_name("mlink-node").is_none());
+    }
+
+    #[test]
+    fn parse_room_hash_returns_none_for_short_suffix() {
+        assert!(parse_room_hash_from_name("mlink#abcd").is_none());
+    }
+
+    #[test]
+    fn parse_room_hash_returns_none_for_non_hex_suffix() {
+        assert!(parse_room_hash_from_name("mlink#zzzzzzzzzzzzzzzz").is_none());
+    }
+
+    #[test]
+    fn parse_room_hash_uses_last_hash() {
+        // A name that legitimately contains `#` still parses the trailing hex.
+        let (base, _) = parse_room_hash_from_name("foo#bar#0011223344556677").unwrap();
+        assert_eq!(base, "foo#bar");
     }
 }

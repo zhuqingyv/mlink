@@ -8,13 +8,14 @@ use mlink_cli::{Cli, Commands, RoomAction, TrustAction};
 use mlink_core::api::stream::create_stream;
 use mlink_core::core::node::{Node, NodeConfig, NodeEvent};
 use mlink_core::core::room::{generate_room_code, room_hash, RoomManager};
+use mlink_core::core::scanner::Scanner;
 use mlink_core::core::security::TrustStore;
 use mlink_core::protocol::errors::MlinkError;
 use mlink_core::protocol::types::MessageType;
 use mlink_core::transport::ble::BleTransport;
 use mlink_core::transport::{DiscoveredPeer, Transport};
 use tokio::signal;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -34,17 +35,36 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<(), MlinkError> {
     match cli.command {
-        Commands::Serve => cmd_serve(None).await,
-        Commands::Room { action } => cmd_room(action).await,
-        Commands::Send { code, file, message } => cmd_send_room(code, file, message).await,
-        Commands::Listen => cmd_listen().await,
+        Some(Commands::Serve) => cmd_serve(None).await,
+        Some(Commands::Room { action }) => cmd_room(action).await,
+        Some(Commands::Send { code, file, message }) => cmd_send_room(code, file, message).await,
+        Some(Commands::Listen) => cmd_listen().await,
 
-        Commands::Scan => cmd_scan().await,
-        Commands::Connect { peer_id } => cmd_connect(peer_id).await,
-        Commands::Ping { peer_id } => cmd_ping(peer_id).await,
-        Commands::Status => cmd_status().await,
-        Commands::Trust { action } => cmd_trust(action).await,
-        Commands::Doctor => cmd_doctor().await,
+        Some(Commands::Scan) => cmd_scan().await,
+        Some(Commands::Connect { peer_id }) => cmd_connect(peer_id).await,
+        Some(Commands::Ping { peer_id }) => cmd_ping(peer_id).await,
+        Some(Commands::Status) => cmd_status().await,
+        Some(Commands::Trust { action }) => cmd_trust(action).await,
+        Some(Commands::Doctor) => cmd_doctor().await,
+
+        // No subcommand → one-shot "join or create a room" mode.
+        None => {
+            let code = match cli.code {
+                Some(c) => {
+                    validate_room_code(&c)?;
+                    println!("[mlink] joining room {c}");
+                    c
+                }
+                None => {
+                    let c = generate_room_code();
+                    println!("[mlink] room created: {c}");
+                    println!("[mlink] share this code with other devices, then run:");
+                    println!("        mlink {c}");
+                    c
+                }
+            };
+            cmd_serve(Some(code)).await
+        }
     }
 }
 
@@ -71,36 +91,87 @@ async fn build_node() -> Result<Node, MlinkError> {
     .await
 }
 
-/// Long-running loop: advertise, scan, and print incoming MESSAGE frames.
-/// If `room_code` is set the BLE advertisement is tagged with its hash so
-/// the peer-side scanner filters us to the same room.
+/// Long-running loop: advertise, scan, auto-connect, print incoming frames.
+/// If `room_code` is set both the peripheral advertisement and the scan filter
+/// are tagged with its hash so the two sides can rendezvous on the same room.
 async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
     let mut node = build_node().await?;
-    let mut transport = BleTransport::new();
-    transport.set_local_name(node.config().name.clone());
-    if let Some(code) = &room_code {
-        transport.set_room_hash(room_hash(code));
-    }
+    let local_name = node.config().name.clone();
+    let room_hash_bytes: Option<[u8; 8]> = room_code.as_deref().map(room_hash);
+
     node.start().await?;
 
     match &room_code {
-        Some(code) => println!(
-            "[mlink] serving as {} in room {}",
-            node.app_uuid(),
-            code
-        ),
+        Some(code) => {
+            println!("[mlink] room: {code}");
+            println!("[mlink] serving as {} — waiting for peers...", node.app_uuid());
+        }
         None => println!("[mlink] serving as {}", node.app_uuid()),
     }
 
-    let mut events = node.subscribe();
-
-    tokio::select! {
-        _ = signal::ctrl_c() => {
-            println!("\n[mlink] shutting down...");
+    // --- 1. Peripheral advertisement (background) ------------------------
+    // Advertises the mlink service so other centrals can find us. On macOS the
+    // room hash is encoded into the advertised local_name; on platforms where
+    // `listen()` is unsupported this task surfaces the error and exits.
+    {
+        let mut listen_transport = BleTransport::new();
+        listen_transport.set_local_name(local_name.clone());
+        if let Some(h) = room_hash_bytes {
+            listen_transport.set_room_hash(h);
         }
-        _ = async {
-            loop {
-                match events.recv().await {
+        tokio::spawn(async move {
+            match listen_transport.listen().await {
+                Ok(_conn) => {
+                    // Keep the peripheral alive by parking here; drop-order on
+                    // ctrl-C will clean up via `close` in BleTransport.
+                    std::future::pending::<()>().await;
+                }
+                Err(e) => eprintln!("[mlink] peripheral advertisement error: {e}"),
+            }
+        });
+    }
+
+    // --- 2. Scan loop (background, only when a room is set) --------------
+    // Scanner pushes newly-seen peers down `peer_rx`; auto-connect runs on the
+    // main task because `Node::connect_peer` needs `&mut Node`.
+    let (peer_tx, mut peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
+    if room_hash_bytes.is_some() {
+        let app_uuid = node.app_uuid().to_string();
+        let hash = room_hash_bytes.expect("is_some checked above");
+        let mut scan_transport = BleTransport::new();
+        scan_transport.set_room_hash(hash);
+        let mut scanner = Scanner::new(Box::new(scan_transport), app_uuid);
+        scanner.set_room_hashes(vec![hash]);
+        tokio::spawn(async move {
+            if let Err(e) = scanner.discover_loop(peer_tx).await {
+                eprintln!("[mlink] scanner error: {e}");
+            }
+        });
+    }
+
+    let mut events = node.subscribe();
+    // Connecting transport reused across auto-connect attempts.
+    let mut connect_transport = BleTransport::new();
+
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                println!("\n[mlink] bye");
+                break;
+            }
+            maybe_peer = peer_rx.recv() => {
+                let peer = match maybe_peer {
+                    Some(p) => p,
+                    None => continue,
+                };
+                println!("[mlink] discovered {} ({}) — connecting...", peer.name, peer.id);
+                match node.connect_peer(&mut connect_transport, &peer).await {
+                    Ok(peer_id) => println!("[mlink] + {peer_id}"),
+                    Err(e) => eprintln!("[mlink] connect {} failed: {e}", peer.id),
+                }
+            }
+            ev = events.recv() => {
+                match ev {
                     Ok(NodeEvent::PeerConnected { peer_id }) => {
                         println!("[mlink] peer connected: {peer_id}");
                     }
@@ -111,10 +182,12 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                         println!("[mlink] peer lost: {peer_id}");
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    // Broadcast lag / sender-dropped → fall through; the main
+                    // loop continues until ctrl-C.
+                    Err(_) => {}
                 }
             }
-        } => {}
+        }
     }
 
     node.stop().await?;
@@ -209,15 +282,29 @@ async fn cmd_send_room(
     }
 
     let mut node = build_node().await?;
-    let mut transport = BleTransport::new();
-    transport.set_room_hash(room_hash(&code));
     node.start().await?;
 
-    let peers = transport.discover().await?;
+    // Scanner owns a transport instance and enforces the room-hash filter so
+    // we only surface peripherals advertising our room. A second transport is
+    // created below for the actual connect path since Scanner takes ownership.
+    let scan_transport = {
+        let mut t = BleTransport::new();
+        t.set_room_hash(room_hash(&code));
+        t
+    };
+    let mut scanner = Scanner::new(Box::new(scan_transport), node.app_uuid().to_string());
+    scanner.set_room_hashes(vec![room_hash(&code)]);
+    let peers = scanner.discover_once().await?;
     if peers.is_empty() {
         println!("[mlink] no peers found in room {code}");
         return Ok(());
     }
+
+    // Separate transport for the connect path (Scanner already consumed the
+    // first one). We still filter advertisements via Scanner above, so `peers`
+    // here is the room-matched set.
+    let mut transport = BleTransport::new();
+    transport.set_room_hash(room_hash(&code));
 
     // Connect to every discovered peer in the room, then broadcast.
     let mut connected: Vec<String> = Vec::new();

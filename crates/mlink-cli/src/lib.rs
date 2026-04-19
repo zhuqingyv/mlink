@@ -3,10 +3,20 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "mlink", about = "Multi-to-multi local device connection layer")]
+#[command(
+    name = "mlink",
+    about = "Multi-to-multi local device connection layer",
+    after_help = "Quick start:\n  \
+      mlink            # generate a new 6-digit room and start serving\n  \
+      mlink 482193     # join an existing room by its 6-digit code\n  \
+      mlink send 482193 hello"
+)]
 pub struct Cli {
+    /// 6-digit room code. Omit to generate a new one. Ignored if a subcommand is given.
+    pub code: Option<String>,
+
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
