@@ -42,6 +42,7 @@ objc2-core-bluetooth = { version = "0.2", features = [
     "CBService",
     "CBUUID",
     "CBATTRequest",
+    "CBError",
 ] }
 
 [dev-dependencies]

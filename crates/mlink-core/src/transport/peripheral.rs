@@ -9,18 +9,22 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use objc2::mutability::InteriorMutable;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{msg_send_id, ClassType};
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{declare_class, msg_send_id, ClassType, DeclaredClass};
 use objc2_core_bluetooth::{
-    CBAdvertisementDataLocalNameKey, CBAdvertisementDataServiceUUIDsKey,
-    CBAttributePermissions, CBCharacteristic, CBCharacteristicProperties, CBManagerState,
-    CBMutableCharacteristic, CBMutableService, CBPeripheralManager, CBUUID,
+    CBATTRequest, CBAdvertisementDataLocalNameKey, CBAdvertisementDataServiceUUIDsKey,
+    CBAttributePermissions, CBCentral, CBCharacteristic, CBCharacteristicProperties,
+    CBManagerState, CBMutableCharacteristic, CBMutableService, CBPeripheralManager,
+    CBPeripheralManagerDelegate, CBService, CBUUID,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSObject, NSString};
+use objc2_foundation::{
+    NSArray, NSData, NSDictionary, NSError, NSObject, NSObjectProtocol, NSString,
+};
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
@@ -48,15 +52,22 @@ pub enum PeripheralEvent {
 type EventSender = mpsc::UnboundedSender<PeripheralEvent>;
 type EventReceiver = mpsc::UnboundedReceiver<PeripheralEvent>;
 
+/// Centrals currently subscribed to the RX characteristic. Wrapped in a `std`
+/// Mutex (not tokio) because we mutate it from Obj-C delegate callbacks which
+/// are non-async.
+type SubscribedCentrals = StdMutex<Vec<Retained<CBCentral>>>;
+
 /// The macOS peripheral. Holds strong references to the CoreBluetooth objects
 /// so they stay alive for the lifetime of the advertisement.
 pub struct MacPeripheral {
     manager: Retained<CBPeripheralManager>,
     _tx_char: Retained<CBMutableCharacteristic>,
-    _rx_char: Retained<CBMutableCharacteristic>,
+    rx_char: Retained<CBMutableCharacteristic>,
     _ctrl_char: Retained<CBMutableCharacteristic>,
     _service: Retained<CBMutableService>,
+    _delegate: Retained<MlinkPeripheralDelegate>,
     events: Arc<Mutex<EventReceiver>>,
+    subscribed: Arc<SubscribedCentrals>,
     local_name: String,
     room_hash: Option<[u8; 8]>,
 }
@@ -71,14 +82,11 @@ impl MacPeripheral {
     ) -> Result<Self> {
         let local_name = local_name.into();
 
-        // Build a minimal Obj-C event pipe. A full delegate subclass would wire
-        // every CBPeripheralManagerDelegate callback to `tx`; we set up the
-        // channel here so downstream async code already has the consumer side,
-        // and the delegate implementation can be filled in progressively.
         let (tx, rx) = mpsc::unbounded_channel::<PeripheralEvent>();
+        let subscribed: Arc<SubscribedCentrals> = Arc::new(StdMutex::new(Vec::new()));
 
         // Service + characteristics.
-        let service = build_service(&tx)?;
+        let service = build_service()?;
         let tx_char = build_characteristic(TX_CHAR_UUID, WRITE_PERMISSIONS, write_properties())?;
         let rx_char = build_characteristic(RX_CHAR_UUID, READ_PERMISSIONS, notify_properties())?;
         let ctrl_char =
@@ -86,13 +94,22 @@ impl MacPeripheral {
 
         attach_characteristics(&service, &[&tx_char, &rx_char, &ctrl_char]);
 
-        // Create the peripheral manager on the main queue (nil = main queue in CB).
-        // We pass `None` for the delegate here; a future revision should install
-        // an Obj-C subclass that forwards callbacks into `tx`. Holding the
-        // sender inside the module keeps the wiring surface small.
+        // Create the delegate. It owns clones of the sender and the subscribed
+        // list; CoreBluetooth will retain the delegate via initWithDelegate:.
+        let delegate = MlinkPeripheralDelegate::new(DelegateIvars {
+            tx: tx.clone(),
+            subscribed: subscribed.clone(),
+            rx_char_uuid: RX_CHAR_UUID,
+        });
+
+        // Create the peripheral manager on the default queue (nil = main in CB).
+        // `initWithDelegate:queue:` takes an Obj-C protocol object for the
+        // delegate; we upcast our concrete delegate into its protocol form.
+        let delegate_proto: &ProtocolObject<dyn CBPeripheralManagerDelegate> =
+            ProtocolObject::from_ref(&*delegate);
         let manager: Retained<CBPeripheralManager> = unsafe {
             let alloc = CBPeripheralManager::alloc();
-            msg_send_id![alloc, initWithDelegate: std::ptr::null::<AnyObject>(), queue: std::ptr::null::<AnyObject>()]
+            msg_send_id![alloc, initWithDelegate: delegate_proto, queue: std::ptr::null::<AnyObject>()]
         };
 
         // Register the service. This is async in CoreBluetooth; real completion
@@ -117,24 +134,23 @@ impl MacPeripheral {
             manager.startAdvertising(Some(&ad_dict));
         }
 
-        // Keep the sender alive on the delegate side; for now we store no
-        // delegate so drop `tx` into a static-ish slot via moving it into a
-        // task that simply keeps it alive. This is a placeholder until a real
-        // delegate class is wired up.
+        // Keep the sender alive across the lifetime of the peripheral. The
+        // delegate holds its own clone, but we also keep one here for any
+        // future direct emission paths (e.g. teardown events).
         tokio::spawn(async move {
             let _keep_alive = tx;
-            // Never completes; dropped when the spawned task is cancelled on
-            // runtime shutdown.
             tokio::time::sleep(Duration::from_secs(u64::MAX / 2)).await;
         });
 
         Ok(Self {
             manager,
             _tx_char: tx_char,
-            _rx_char: rx_char,
+            rx_char,
             _ctrl_char: ctrl_char,
             _service: service,
+            _delegate: delegate,
             events: Arc::new(Mutex::new(rx)),
+            subscribed,
             local_name,
             room_hash,
         })
@@ -168,6 +184,32 @@ impl MacPeripheral {
         }
     }
 
+    /// Push bytes to every currently-subscribed central via the RX notify
+    /// characteristic. Returns `false` if CoreBluetooth's send queue is full
+    /// (caller should wait and retry); `true` on success or if there are no
+    /// subscribers yet.
+    pub fn notify_subscribed(&self, data: &[u8]) -> bool {
+        let centrals: Vec<Retained<CBCentral>> = match self.subscribed.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return false,
+        };
+        if centrals.is_empty() {
+            // No one listening yet — treat as success; upper layers haven't
+            // observed a subscribe event anyway.
+            return true;
+        }
+        let ns_data = NSData::with_bytes(data);
+        let refs: Vec<&CBCentral> = centrals.iter().map(|c| &**c).collect();
+        let arr: Retained<NSArray<CBCentral>> = NSArray::from_slice(&refs);
+        unsafe {
+            self.manager.updateValue_forCharacteristic_onSubscribedCentrals(
+                &ns_data,
+                &self.rx_char,
+                Some(&arr),
+            )
+        }
+    }
+
     pub fn stop_advertising(&self) {
         unsafe {
             self.manager.stopAdvertising();
@@ -188,6 +230,172 @@ impl Drop for MacPeripheral {
 // the raw Obj-C handles behind `&self` accessors.
 unsafe impl Send for MacPeripheral {}
 unsafe impl Sync for MacPeripheral {}
+
+// ---------- delegate ----------
+
+/// Ivars held by the declared Obj-C delegate class. Keeps the channel sender
+/// and the shared subscribed-centrals list accessible from delegate callbacks.
+struct DelegateIvars {
+    tx: EventSender,
+    subscribed: Arc<SubscribedCentrals>,
+    rx_char_uuid: Uuid,
+}
+
+declare_class!(
+    struct MlinkPeripheralDelegate;
+
+    // SAFETY:
+    // - The superclass NSObject has no additional subclassing requirements.
+    // - `InteriorMutable` is correct: we mutate `subscribed` through a Mutex,
+    //   never with `&mut self`.
+    // - `Drop` is not implemented; Ivars hold ordinary owned values that drop
+    //   themselves via Rust's usual rules.
+    unsafe impl ClassType for MlinkPeripheralDelegate {
+        type Super = NSObject;
+        type Mutability = InteriorMutable;
+        const NAME: &'static str = "MlinkPeripheralDelegate";
+    }
+
+    impl DeclaredClass for MlinkPeripheralDelegate {
+        type Ivars = DelegateIvars;
+    }
+
+    unsafe impl NSObjectProtocol for MlinkPeripheralDelegate {}
+
+    unsafe impl CBPeripheralManagerDelegate for MlinkPeripheralDelegate {
+        #[method(peripheralManagerDidUpdateState:)]
+        fn peripheral_manager_did_update_state(&self, peripheral: &CBPeripheralManager) {
+            let state = unsafe { peripheral.state() };
+            let _ = self.ivars().tx.send(PeripheralEvent::StateChanged(state));
+        }
+
+        #[method(peripheralManagerDidStartAdvertising:error:)]
+        fn peripheral_manager_did_start_advertising_error(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            error: Option<&NSError>,
+        ) {
+            let res = match error {
+                None => Ok(()),
+                Some(e) => Err(format!("{}", e.localizedDescription())),
+            };
+            let _ = self.ivars().tx.send(PeripheralEvent::AdvertisingStarted(res));
+        }
+
+        #[method(peripheralManager:didAddService:error:)]
+        fn peripheral_manager_did_add_service_error(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            _service: &CBService,
+            error: Option<&NSError>,
+        ) {
+            let res = match error {
+                None => Ok(()),
+                Some(e) => Err(format!("{}", e.localizedDescription())),
+            };
+            let _ = self.ivars().tx.send(PeripheralEvent::ServiceAdded(res));
+        }
+
+        #[method(peripheralManager:central:didSubscribeToCharacteristic:)]
+        fn peripheral_manager_central_did_subscribe(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            central: &CBCentral,
+            characteristic: &CBCharacteristic,
+        ) {
+            // Only record subscribes to the RX notify characteristic; other
+            // characteristics (e.g. CTRL) may be subscribed independently.
+            let uuid_str = unsafe { characteristic.UUID().UUIDString().to_string() };
+            if !uuid_matches(&uuid_str, &self.ivars().rx_char_uuid) {
+                return;
+            }
+
+            // Retain the central so we can later target it in updateValue:.
+            let retained: Retained<CBCentral> = unsafe {
+                Retained::retain(central as *const CBCentral as *mut CBCentral)
+                    .expect("CBCentral retain failed")
+            };
+            let id = unsafe { retained.identifier().UUIDString().to_string() };
+            if let Ok(mut guard) = self.ivars().subscribed.lock() {
+                guard.push(retained);
+            }
+            let _ = self
+                .ivars()
+                .tx
+                .send(PeripheralEvent::CentralSubscribed { central_id: id });
+        }
+
+        #[method(peripheralManager:central:didUnsubscribeFromCharacteristic:)]
+        fn peripheral_manager_central_did_unsubscribe(
+            &self,
+            _peripheral: &CBPeripheralManager,
+            central: &CBCentral,
+            _characteristic: &CBCharacteristic,
+        ) {
+            let target_id = unsafe { central.identifier().UUIDString().to_string() };
+            if let Ok(mut guard) = self.ivars().subscribed.lock() {
+                guard.retain(|c| {
+                    let id = unsafe { c.identifier().UUIDString().to_string() };
+                    id != target_id
+                });
+            }
+        }
+
+        #[method(peripheralManager:didReceiveWriteRequests:)]
+        fn peripheral_manager_did_receive_writes(
+            &self,
+            peripheral: &CBPeripheralManager,
+            requests: &NSArray<CBATTRequest>,
+        ) {
+            // Collect bytes from every request; CoreBluetooth batches writes.
+            // Per Apple docs we must respond to the FIRST request in the array
+            // to acknowledge them all.
+            let count = requests.len();
+            for i in 0..count {
+                let req = requests.get(i).expect("request index in range");
+                if let Some(data) = unsafe { req.value() } {
+                    let bytes = data.bytes().to_vec();
+                    if !bytes.is_empty() {
+                        let _ = self.ivars().tx.send(PeripheralEvent::Received(bytes));
+                    }
+                }
+            }
+            if count > 0 {
+                let first = requests.get(0).expect("non-empty");
+                unsafe {
+                    peripheral.respondToRequest_withResult(
+                        &first,
+                        objc2_core_bluetooth::CBATTError::Success,
+                    );
+                }
+            }
+        }
+    }
+);
+
+impl MlinkPeripheralDelegate {
+    fn new(ivars: DelegateIvars) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(ivars);
+        unsafe { msg_send_id![super(this), init] }
+    }
+}
+
+// SAFETY: the delegate is driven by CoreBluetooth on whatever queue we passed
+// (default main). All cross-thread access to Ivars goes through an mpsc sender
+// (Send+Sync) and a Mutex. Holding `Retained<MlinkPeripheralDelegate>` on the
+// `MacPeripheral` struct just keeps the Obj-C class alive; we never read
+// `DelegateIvars` from Rust-side threads directly.
+unsafe impl Send for MlinkPeripheralDelegate {}
+unsafe impl Sync for MlinkPeripheralDelegate {}
+
+fn uuid_matches(uuid_str: &str, expected: &Uuid) -> bool {
+    // CoreBluetooth returns short-form UUIDs for standard attributes and the
+    // full 128-bit form for custom ones. Our characteristics are all custom
+    // 128-bit, so a case-insensitive compare against the canonical hex is
+    // sufficient.
+    let needle = expected.to_string();
+    uuid_str.eq_ignore_ascii_case(&needle)
+}
 
 // ---------- helpers ----------
 
@@ -211,7 +419,7 @@ fn read_write_properties() -> CBCharacteristicProperties {
         | CBCharacteristicProperties::CBCharacteristicPropertyWrite
 }
 
-fn build_service(_tx: &EventSender) -> Result<Retained<CBMutableService>> {
+fn build_service() -> Result<Retained<CBMutableService>> {
     let uuid = cb_uuid_from(MLINK_SERVICE_UUID)?;
     unsafe {
         let alloc = CBMutableService::alloc();
@@ -303,11 +511,9 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// A placeholder `Connection` returned from `listen()` on macOS: the service is
-/// advertised and the CoreBluetooth stack is primed, but we don't yet have a
-/// real bidirectional byte channel wired through the delegate. Reads block
-/// until the channel is closed; writes are buffered into an unbounded queue so
-/// upper layers can exercise code paths without a real central attached.
+/// `Connection` returned from `listen()` on macOS. Reads pull from the delegate's
+/// event channel and return bytes from `didReceiveWriteRequests:`. Writes push
+/// bytes to subscribed centrals via `updateValue:forCharacteristic:onSubscribedCentrals:`.
 pub struct MacPeripheralConnection {
     peer_id: String,
     peripheral: Arc<MacPeripheral>,
@@ -342,11 +548,22 @@ impl Connection for MacPeripheralConnection {
         }
     }
 
-    async fn write(&mut self, _data: &[u8]) -> Result<()> {
-        // Real implementation should call
-        // peripheralManager.updateValue:forCharacteristic:onSubscribedCentrals:
-        // against the RX characteristic. Until the delegate wiring lands we
-        // accept writes silently so upper layers don't stall.
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
+        // CoreBluetooth's `updateValue:forCharacteristic:onSubscribedCentrals:`
+        // returns `false` when the internal send queue is full; the correct
+        // recovery path is to wait for `peripheralManagerIsReadyToUpdateSubscribers:`
+        // and retry. We approximate with a short backoff loop so callers don't
+        // need to know about the transient-busy state.
+        let mut attempts = 0;
+        while !self.peripheral.notify_subscribed(data) {
+            attempts += 1;
+            if attempts > 50 {
+                return Err(MlinkError::HandlerError(
+                    "peripheral updateValue queue stayed full for >500ms".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         Ok(())
     }
 
@@ -373,5 +590,20 @@ mod tests {
     #[test]
     fn cb_uuid_from_accepts_mlink_service_uuid() {
         let _ = cb_uuid_from(MLINK_SERVICE_UUID).expect("valid uuid");
+    }
+
+    #[test]
+    fn uuid_matches_ignores_case() {
+        let u = RX_CHAR_UUID;
+        assert!(uuid_matches(&u.to_string().to_lowercase(), &u));
+        assert!(uuid_matches(&u.to_string().to_uppercase(), &u));
+        assert!(!uuid_matches("00000000-0000-0000-0000-000000000000", &u));
+    }
+
+    #[test]
+    fn delegate_class_registers() {
+        // Forces the declare_class! registration path to run; panics in debug
+        // builds if any method signature disagrees with the protocol.
+        let _cls = MlinkPeripheralDelegate::class();
     }
 }

@@ -15,7 +15,7 @@ use crate::protocol::frame::{decode_frame, encode_frame};
 use crate::protocol::types::{
     decode_flags, encode_flags, Frame, Handshake, MessageType, MAGIC, PROTOCOL_VERSION,
 };
-use crate::transport::{DiscoveredPeer, Transport};
+use crate::transport::{Connection, DiscoveredPeer, Transport};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -223,6 +223,27 @@ impl Node {
         });
 
         Ok(peer_id)
+    }
+
+    /// Test hook: install a `Connection` for `peer_id` directly, bypassing
+    /// transport discovery and handshake. Used by end-to-end tests to drive
+    /// the Node with a pre-wired mock (e.g. `MockTransport::pair`).
+    ///
+    /// Production code paths should use `connect_peer` instead, which performs
+    /// the handshake and wires up the full PeerState.
+    pub async fn attach_connection(&mut self, peer_id: String, conn: Box<dyn Connection>) {
+        {
+            let mut guard = self.connections.lock().await;
+            guard.add(peer_id.clone(), conn).await;
+        }
+        {
+            let mut states = self.peer_states.write().await;
+            let entry = states.entry(peer_id.clone()).or_insert_with(PeerState::new);
+            entry.state = NodeState::Connected;
+            entry.last_heartbeat = Some(Instant::now());
+        }
+        self.state = NodeState::Connected;
+        let _ = self.events_tx.send(NodeEvent::PeerConnected { peer_id });
     }
 
     pub async fn disconnect_peer(&mut self, peer_id: &str) -> Result<()> {
@@ -571,5 +592,35 @@ mod tests {
     #[test]
     fn test_config_helper_used() {
         let _c = test_config();
+    }
+
+    #[tokio::test]
+    async fn attach_connection_enables_send_recv_without_handshake() {
+        let _tmp = set_tmp_home();
+        let tmp2 = tempfile::tempdir().expect("tmp2");
+        let mut node = Node::new(tmp_config(tmp2.path().join("t.json")))
+            .await
+            .expect("new");
+
+        let (a, mut b) = crate::transport::mock::mock_pair();
+        node.attach_connection("mock-peer-b".into(), Box::new(a)).await;
+
+        assert_eq!(node.connection_count().await, 1);
+        assert_eq!(
+            node.peer_state("mock-peer-b").await,
+            Some(NodeState::Connected)
+        );
+        assert_eq!(node.state(), NodeState::Connected);
+
+        // End-to-end frame over the attached mock.
+        node.send_raw("mock-peer-b", MessageType::Message, b"hello")
+            .await
+            .expect("send");
+
+        use crate::transport::Connection as _;
+        let bytes = b.read().await.expect("peer read");
+        let frame = crate::protocol::frame::decode_frame(&bytes).expect("decode");
+        let (_, _, mt) = crate::protocol::types::decode_flags(frame.flags);
+        assert_eq!(mt, MessageType::Message);
     }
 }
