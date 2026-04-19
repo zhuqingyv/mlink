@@ -33,6 +33,9 @@ pub enum MlinkError {
     #[error("compress error: {0}")]
     CompressError(String),
 
+    #[error("room mismatch with peer {peer_id}")]
+    RoomMismatch { peer_id: String },
+
     #[error("ble error: {0}")]
     Ble(#[from] btleplug::Error),
 
@@ -85,6 +88,14 @@ mod tests {
     fn backpressure_display() {
         let e = MlinkError::Backpressure;
         assert_eq!(e.to_string(), "backpressure: receiver overloaded");
+    }
+
+    #[test]
+    fn room_mismatch_display() {
+        let e = MlinkError::RoomMismatch {
+            peer_id: "abc".into(),
+        };
+        assert_eq!(e.to_string(), "room mismatch with peer abc");
     }
 
     #[test]

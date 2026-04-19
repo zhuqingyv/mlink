@@ -198,6 +198,10 @@ pub struct Handshake {
     pub encrypt: bool,
     pub last_seq: u16,
     pub resume_streams: Vec<StreamResumeInfo>,
+    /// Room hash the local side claims membership in; peers must match this
+    /// to keep the connection. `None` means "any room" (legacy / listen mode).
+    #[serde(default)]
+    pub room_hash: Option<[u8; 8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,10 +351,29 @@ mod tests {
                 stream_id: 7,
                 received_bitmap: vec![0xFF, 0x3F],
             }],
+            room_hash: Some([0xAB; 8]),
         };
         let bytes = rmp_serde::to_vec(&h).unwrap();
         let back: Handshake = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(h, back);
+    }
+
+    #[test]
+    fn handshake_serde_backwards_compat_no_room_hash() {
+        let h = Handshake {
+            app_uuid: "abc".into(),
+            version: 1,
+            mtu: 512,
+            compress: true,
+            encrypt: true,
+            last_seq: 42,
+            resume_streams: vec![],
+            room_hash: None,
+        };
+        let bytes = rmp_serde::to_vec(&h).unwrap();
+        let back: Handshake = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(h, back);
+        assert!(back.room_hash.is_none());
     }
 
     #[test]

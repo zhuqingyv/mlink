@@ -203,6 +203,7 @@ mod tests {
             encrypt: true,
             last_seq: 0,
             resume_streams: vec![],
+            room_hash: None,
         }
     }
 

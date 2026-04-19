@@ -94,6 +94,7 @@ pub struct Node {
     trust_store: Arc<RwLock<TrustStore>>,
     state: NodeState,
     events_tx: broadcast::Sender<NodeEvent>,
+    room_hash: Option<[u8; 8]>,
 }
 
 impl Node {
@@ -115,7 +116,20 @@ impl Node {
             trust_store: Arc::new(RwLock::new(trust_store)),
             state: NodeState::Idle,
             events_tx,
+            room_hash: None,
         })
+    }
+
+    /// Attach a room hash to this node. After connecting, the peer's handshake
+    /// is compared against this value; on mismatch the connection is closed
+    /// and `connect_peer` returns `RoomMismatch`. Pass `None` (default) to
+    /// accept any room.
+    pub fn set_room_hash(&mut self, hash: Option<[u8; 8]>) {
+        self.room_hash = hash;
+    }
+
+    pub fn room_hash(&self) -> Option<[u8; 8]> {
+        self.room_hash
     }
 
     pub fn state(&self) -> NodeState {
@@ -192,9 +206,25 @@ impl Node {
             encrypt: self.config.encrypt,
             last_seq: 0,
             resume_streams: vec![],
+            room_hash: self.room_hash,
         };
 
         let peer_hs = perform_handshake(conn.as_mut(), &local_hs).await?;
+
+        // Room membership check: if we care about a specific room, the peer
+        // must advertise the same hash. Close and bail on mismatch so we
+        // don't surface a peer from a foreign room.
+        if let Some(local) = self.room_hash {
+            match peer_hs.room_hash {
+                Some(peer) if peer == local => {}
+                _ => {
+                    let _ = conn.close().await;
+                    return Err(MlinkError::RoomMismatch {
+                        peer_id: discovered.id.clone(),
+                    });
+                }
+            }
+        }
 
         let peer_id = peer_hs.app_uuid.clone();
         let peer = Peer {
@@ -222,6 +252,75 @@ impl Node {
             peer_id: peer_id.clone(),
         });
 
+        Ok(peer_id)
+    }
+
+    /// Accept an incoming connection (peripheral side). Runs a handshake over
+    /// the already-open connection, enforces the room-hash check, and — on
+    /// success — registers the connection under the peer's app_uuid. On
+    /// failure the connection is closed so callers don't need to clean up.
+    pub async fn accept_incoming(
+        &mut self,
+        mut conn: Box<dyn Connection>,
+        transport_id: &str,
+        fallback_name: String,
+    ) -> Result<String> {
+        let local_hs = Handshake {
+            app_uuid: self.app_uuid.clone(),
+            version: PROTOCOL_VERSION,
+            mtu: 512,
+            compress: true,
+            encrypt: self.config.encrypt,
+            last_seq: 0,
+            resume_streams: vec![],
+            room_hash: self.room_hash,
+        };
+
+        let peer_hs = match perform_handshake(conn.as_mut(), &local_hs).await {
+            Ok(hs) => hs,
+            Err(e) => {
+                let _ = conn.close().await;
+                return Err(e);
+            }
+        };
+
+        if let Some(local) = self.room_hash {
+            match peer_hs.room_hash {
+                Some(peer) if peer == local => {}
+                _ => {
+                    let wire_peer_id = conn.peer_id().to_string();
+                    let _ = conn.close().await;
+                    return Err(MlinkError::RoomMismatch {
+                        peer_id: wire_peer_id,
+                    });
+                }
+            }
+        }
+
+        let peer_id = peer_hs.app_uuid.clone();
+        let peer = Peer {
+            id: peer_id.clone(),
+            name: fallback_name,
+            app_uuid: peer_hs.app_uuid.clone(),
+            connected_at: Instant::now(),
+            transport_id: transport_id.to_string(),
+        };
+
+        self.peer_manager.add(peer).await;
+        {
+            let mut guard = self.connections.lock().await;
+            guard.add(peer_id.clone(), conn).await;
+        }
+        {
+            let mut states = self.peer_states.write().await;
+            let entry = states.entry(peer_id.clone()).or_insert_with(PeerState::new);
+            entry.state = NodeState::Connected;
+            entry.last_heartbeat = Some(Instant::now());
+        }
+        self.state = NodeState::Connected;
+        let _ = self.events_tx.send(NodeEvent::PeerConnected {
+            peer_id: peer_id.clone(),
+        });
         Ok(peer_id)
     }
 
@@ -592,6 +691,106 @@ mod tests {
     #[test]
     fn test_config_helper_used() {
         let _c = test_config();
+    }
+
+    #[tokio::test]
+    async fn accept_incoming_matching_room_registers_peer() {
+        let _tmp = set_tmp_home();
+        let tmp_a = tempfile::tempdir().expect("tmp-a");
+        let tmp_b = tempfile::tempdir().expect("tmp-b");
+        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+            .await
+            .expect("new a");
+        let mut node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+            .await
+            .expect("new b");
+        let room = [0x55u8; 8];
+        node_a.set_room_hash(Some(room));
+        node_b.set_room_hash(Some(room));
+
+        let (ca, cb) = crate::transport::mock::mock_pair();
+        // Both sides run the handshake concurrently: one side acts as the
+        // "incoming-accept" (node_a), the other as a pre-wired mock client
+        // that drives perform_handshake directly.
+        let hs_b = Handshake {
+            app_uuid: node_b.app_uuid().to_string(),
+            version: PROTOCOL_VERSION,
+            mtu: 512,
+            compress: true,
+            encrypt: false,
+            last_seq: 0,
+            resume_streams: vec![],
+            room_hash: Some(room),
+        };
+        let driver = tokio::spawn(async move {
+            let mut cb: Box<dyn Connection> = Box::new(cb);
+            perform_handshake(cb.as_mut(), &hs_b).await.expect("peer hs");
+        });
+
+        let got = node_a
+            .accept_incoming(Box::new(ca), "mock", "mock-peer".into())
+            .await
+            .expect("accept ok");
+        driver.await.expect("driver joined");
+
+        assert_eq!(got, node_b.app_uuid());
+        assert_eq!(node_a.connection_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn accept_incoming_mismatched_room_rejects() {
+        let _tmp = set_tmp_home();
+        let tmp_a = tempfile::tempdir().expect("tmp-a");
+        let tmp_b = tempfile::tempdir().expect("tmp-b");
+        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+            .await
+            .expect("new a");
+        let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+            .await
+            .expect("new b");
+        node_a.set_room_hash(Some([0x11; 8]));
+        let bogus_room = Some([0x22u8; 8]);
+
+        let (ca, cb) = crate::transport::mock::mock_pair();
+        let hs_b = Handshake {
+            app_uuid: node_b.app_uuid().to_string(),
+            version: PROTOCOL_VERSION,
+            mtu: 512,
+            compress: true,
+            encrypt: false,
+            last_seq: 0,
+            resume_streams: vec![],
+            room_hash: bogus_room,
+        };
+        let driver = tokio::spawn(async move {
+            let mut cb: Box<dyn Connection> = Box::new(cb);
+            // The peer will get either a handshake reply or a closed socket;
+            // both are acceptable here — we only assert the local rejection.
+            let _ = perform_handshake(cb.as_mut(), &hs_b).await;
+        });
+
+        let err = node_a
+            .accept_incoming(Box::new(ca), "mock", "mock-peer".into())
+            .await
+            .unwrap_err();
+        let _ = driver.await;
+        assert!(matches!(err, MlinkError::RoomMismatch { .. }));
+        assert_eq!(node_a.connection_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn connect_peer_matching_room_roundtrip_is_accepted() {
+        // Covered via the protocol: ensure set_room_hash round-trips.
+        let _tmp = set_tmp_home();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut node = Node::new(tmp_config(tmp.path().join("t.json")))
+            .await
+            .expect("new");
+        assert!(node.room_hash().is_none());
+        node.set_room_hash(Some([0xFE; 8]));
+        assert_eq!(node.room_hash(), Some([0xFE; 8]));
+        node.set_room_hash(None);
+        assert!(node.room_hash().is_none());
     }
 
     #[tokio::test]

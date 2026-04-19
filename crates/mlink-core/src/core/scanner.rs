@@ -53,8 +53,18 @@ impl Scanner {
         &self.room_hashes
     }
 
+    /// Returns `true` if the peer should be surfaced under the current room
+    /// filter. The filter is soft: when `metadata` is empty we pass the peer
+    /// through because some transports (notably macOS BLE) can't read the
+    /// advertised room hash from a peripheral before connecting. Room
+    /// membership is then verified post-handshake at the Node layer; here we
+    /// only avoid surfacing peers that *positively advertise a different*
+    /// room when `hashes` is set.
     fn metadata_matches_any_room(metadata: &[u8], hashes: &[[u8; 8]]) -> bool {
         if hashes.is_empty() {
+            return true;
+        }
+        if metadata.is_empty() {
             return true;
         }
         if metadata.len() < 8 {
@@ -297,6 +307,9 @@ mod tests {
         let mut meta_with = vec![0x01, 0x02];
         meta_with.extend_from_slice(&hash);
         meta_with.push(0x99);
+        // Peer "a" carries a matching hash in metadata → keep.
+        // Peer "b" advertises a *different* 8-byte chunk → drop (wrong room).
+        // Peer "c" has no metadata → soft-pass (room verified post-handshake).
         let t = ScriptedTransport::new(vec![vec![
             peer_with_meta("a", meta_with),
             peer_with_meta("b", vec![0, 0, 0, 0, 0, 0, 0, 0]),
@@ -304,9 +317,25 @@ mod tests {
         ]]);
         let mut s = Scanner::new(Box::new(t), "self-uuid");
         s.set_room_hashes(vec![hash]);
+        let mut got = s.discover_once().await.unwrap();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "a");
+        assert_eq!(got[1].id, "c");
+    }
+
+    #[tokio::test]
+    async fn empty_metadata_passes_under_room_filter() {
+        // Explicitly document the soft-pass: when metadata is empty we must
+        // surface the peer even though a room filter is set, because
+        // macOS BLE can't read the advertised room hash pre-connect.
+        let hash: [u8; 8] = [9; 8];
+        let t = ScriptedTransport::new(vec![vec![peer_with_meta("x", Vec::new())]]);
+        let mut s = Scanner::new(Box::new(t), "self-uuid");
+        s.set_room_hashes(vec![hash]);
         let got = s.discover_once().await.unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].id, "a");
+        assert_eq!(got[0].id, "x");
     }
 
     #[tokio::test]
