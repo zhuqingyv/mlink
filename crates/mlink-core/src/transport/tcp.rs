@@ -85,6 +85,19 @@ impl Default for TcpTransport {
     }
 }
 
+/// Health-probe helper used by `mlink doctor --transport tcp`: verifies an
+/// mDNS `ServiceDaemon` can start and shut down cleanly. Does not register
+/// any service — just exercises the socket/thread setup that real discovery
+/// needs, so it catches "mdns-sd daemon can't come up" failures early.
+pub fn probe_mdns_daemon() -> Result<()> {
+    let daemon = ServiceDaemon::new()
+        .map_err(|e| MlinkError::HandlerError(format!("mdns daemon start: {e}")))?;
+    daemon
+        .shutdown()
+        .map_err(|e| MlinkError::HandlerError(format!("mdns daemon shutdown: {e}")))?;
+    Ok(())
+}
+
 #[async_trait]
 impl Transport for TcpTransport {
     fn id(&self) -> &str {

@@ -13,7 +13,7 @@ use mlink_core::core::security::TrustStore;
 use mlink_core::protocol::errors::MlinkError;
 use mlink_core::protocol::types::MessageType;
 use mlink_core::transport::ble::BleTransport;
-use mlink_core::transport::tcp::TcpTransport;
+use mlink_core::transport::tcp::{probe_mdns_daemon, TcpTransport};
 use mlink_core::transport::{Connection, DiscoveredPeer, Transport};
 use tokio::signal;
 use tokio::sync::{mpsc, Mutex};
@@ -39,15 +39,18 @@ async fn run(cli: Cli) -> Result<(), MlinkError> {
     match cli.command {
         Some(Commands::Serve) => cmd_serve(None, kind).await,
         Some(Commands::Room { action }) => cmd_room(action, kind).await,
-        Some(Commands::Send { code, file, message }) => cmd_send_room(code, file, message).await,
+        Some(Commands::Send { code, file, message }) => {
+            cmd_send_room(code, file, message, kind).await
+        }
         Some(Commands::Listen) => cmd_listen(kind).await,
+        Some(Commands::Chat { code }) => cmd_chat(code, kind).await,
 
-        Some(Commands::Scan) => cmd_scan().await,
-        Some(Commands::Connect { peer_id }) => cmd_connect(peer_id).await,
-        Some(Commands::Ping { peer_id }) => cmd_ping(peer_id).await,
+        Some(Commands::Scan) => cmd_scan(kind).await,
+        Some(Commands::Connect { peer_id }) => cmd_connect(peer_id, kind).await,
+        Some(Commands::Ping { peer_id }) => cmd_ping(peer_id, kind).await,
         Some(Commands::Status) => cmd_status().await,
         Some(Commands::Trust { action }) => cmd_trust(action).await,
-        Some(Commands::Doctor) => cmd_doctor().await,
+        Some(Commands::Doctor) => cmd_doctor(kind).await,
 
         // No subcommand → one-shot "join or create a room" mode.
         None => {
@@ -426,6 +429,338 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
     Ok(())
 }
 
+/// Interactive chat: same connect/accept plumbing as `cmd_serve`, plus a
+/// stdin reader that broadcasts each typed line and a per-peer reader task
+/// that surfaces incoming messages as `NodeEvent::MessageReceived` which we
+/// print inline with the rest of the event log.
+async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
+    validate_room_code(&code)?;
+
+    let mut node = build_node().await?;
+    let local_name = node.config().name.clone();
+    let hash = room_hash(&code);
+    node.set_room_hash(Some(hash));
+    node.start().await?;
+
+    println!("[mlink] chat: room {code}");
+    println!(
+        "[mlink] chatting as {} via {} — type a line and press Enter to broadcast",
+        node.app_uuid(),
+        transport_label(kind)
+    );
+
+    // --- Peripheral / TCP accept (same pattern as serve) -----------------
+    let (accepted_tx, mut accepted_rx) = mpsc::channel::<Box<dyn Connection>>(4);
+    match kind {
+        TransportKind::Ble => {
+            let mut listen_transport = BleTransport::new();
+            listen_transport.set_local_name(local_name.clone());
+            listen_transport.set_room_hash(hash);
+            let local_name_for_task = local_name.clone();
+            tokio::spawn(async move {
+                #[cfg(target_os = "macos")]
+                {
+                    let peripheral = match listen_transport.start_peripheral().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[mlink] peripheral advertisement error: {e}");
+                            print_bluetooth_permission_hint();
+                            return;
+                        }
+                    };
+                    loop {
+                        let central_id = match peripheral.wait_for_central().await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("[mlink] peripheral accept error: {e}");
+                                return;
+                            }
+                        };
+                        let conn: Box<dyn Connection> = Box::new(
+                            mlink_core::transport::peripheral::MacPeripheralConnection::new(
+                                central_id.clone(),
+                                peripheral.clone(),
+                            ),
+                        );
+                        if accepted_tx.send(conn).await.is_err() {
+                            return;
+                        }
+                        eprintln!(
+                            "[mlink:debug] peripheral accepted central {central_id} (as {local_name_for_task})"
+                        );
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (local_name_for_task, accepted_tx);
+                    match listen_transport.listen().await {
+                        Ok(_conn) => {
+                            std::future::pending::<()>().await;
+                        }
+                        Err(e) => {
+                            eprintln!("[mlink] peripheral advertisement error: {e}");
+                            print_bluetooth_permission_hint();
+                        }
+                    }
+                }
+            });
+        }
+        TransportKind::Tcp => {
+            let mut listen_transport = TcpTransport::new();
+            listen_transport.set_local_name(local_name.clone());
+            listen_transport.set_room_hash(hash);
+            tokio::spawn(async move {
+                loop {
+                    match listen_transport.listen().await {
+                        Ok(conn) => {
+                            if accepted_tx.send(conn).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[mlink] tcp accept error: {e}");
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // --- Scan loop (room-filtered) ---------------------------------------
+    let (peer_tx, mut peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
+    let (unsee_tx, unsee_rx) = mpsc::channel::<String>(16);
+    {
+        let app_uuid = node.app_uuid().to_string();
+        let scan_transport: Box<dyn Transport> = match kind {
+            TransportKind::Ble => {
+                let mut t = BleTransport::new();
+                t.set_room_hash(hash);
+                Box::new(t)
+            }
+            TransportKind::Tcp => {
+                let mut t = TcpTransport::new();
+                t.set_room_hash(hash);
+                Box::new(t)
+            }
+        };
+        let mut scanner = Scanner::new(scan_transport, app_uuid);
+        scanner.set_room_hashes(vec![hash]);
+        scanner.set_unsee_channel(unsee_rx);
+        tokio::spawn(async move {
+            if let Err(e) = scanner.discover_loop(peer_tx).await {
+                eprintln!("[mlink] scanner error: {e}");
+            }
+        });
+    }
+
+    // --- Stdin reader ----------------------------------------------------
+    // Forwards each typed line to the main select loop. Using a bounded mpsc
+    // keeps backpressure on fast typists (or piped-in files) so we don't grow
+    // the queue unboundedly while a broadcast is mid-flight.
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let stdin = tokio::io::stdin();
+        let mut lines = BufReader::new(stdin).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if stdin_tx.send(line).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => return, // stdin closed
+                Err(e) => {
+                    eprintln!("[mlink] stdin read error: {e}");
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut events = node.subscribe();
+    let mut connect_transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => Box::new(BleTransport::new()),
+        TransportKind::Tcp => Box::new(TcpTransport::new()),
+    };
+    use std::collections::{HashMap, HashSet};
+    let mut engaged_wire_ids: HashSet<String> = HashSet::new();
+    const MAX_RETRIES: u8 = 3;
+    let mut attempts: HashMap<String, u8> = HashMap::new();
+    let mut connected_inbound: HashSet<String> = HashSet::new();
+    // Reader-task handles per peer id. Kept so we can abort on disconnect
+    // and avoid double-spawning if the same peer_id reconnects.
+    let mut readers: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // Pretty names keyed by app_uuid so incoming messages print as
+    // `[name] message` instead of `[uuid] message` once the handshake name
+    // is known. Falls back to the uuid itself before we've seen the peer.
+    let mut peer_names: HashMap<String, String> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                println!("\n[mlink] bye");
+                break;
+            }
+            maybe_line = stdin_rx.recv() => {
+                let Some(line) = maybe_line else { continue; };
+                // Broadcast to every peer we currently have a connection with.
+                let peers = node.peers().await;
+                if peers.is_empty() {
+                    println!("[mlink] (no peers yet — message dropped)");
+                    continue;
+                }
+                for p in &peers {
+                    if let Err(e) = node
+                        .send_raw(&p.id, MessageType::Message, line.as_bytes())
+                        .await
+                    {
+                        eprintln!("[mlink] send to {} failed: {e}", p.id);
+                    }
+                }
+            }
+            maybe_peer = peer_rx.recv() => {
+                let peer = match maybe_peer {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if connected_inbound.contains(&peer.id) || engaged_wire_ids.contains(&peer.id) {
+                    continue;
+                }
+                let attempt = attempts.entry(peer.id.clone()).or_insert(0);
+                if *attempt >= MAX_RETRIES {
+                    continue;
+                }
+                *attempt += 1;
+                let attempt_no = *attempt;
+                engaged_wire_ids.insert(peer.id.clone());
+                println!(
+                    "[mlink] discovered {} ({}) — connecting (attempt {}/{})...",
+                    peer.name, peer.id, attempt_no, MAX_RETRIES
+                );
+                let peer_wire_id = peer.id.clone();
+                let peer_wire_name = peer.name.clone();
+                let dial_result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    node.connect_peer(connect_transport.as_mut(), &peer),
+                )
+                .await;
+                let dial_result = match dial_result {
+                    Ok(inner) => inner,
+                    Err(_) => Err(MlinkError::HandlerError(format!(
+                        "connect to {} timed out after {:?}",
+                        peer_wire_id, CONNECT_TIMEOUT
+                    ))),
+                };
+                match dial_result {
+                    Ok(peer_id) => {
+                        println!("[mlink] + {peer_id}");
+                        attempts.remove(&peer_wire_id);
+                        peer_names.insert(peer_id.clone(), peer_wire_name);
+                        if !readers.contains_key(&peer_id) {
+                            readers.insert(peer_id.clone(), node.spawn_peer_reader(peer_id));
+                        }
+                    }
+                    Err(MlinkError::RoomMismatch { peer_id }) => {
+                        println!("[mlink] dropped {peer_id}: different room");
+                        attempts.insert(peer_wire_id.clone(), MAX_RETRIES);
+                        engaged_wire_ids.remove(&peer_wire_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[mlink] connect {} failed: {e}", peer_wire_id);
+                        engaged_wire_ids.remove(&peer_wire_id);
+                        let delay = random_backoff();
+                        let unsee_tx = unsee_tx.clone();
+                        let wire_id = peer_wire_id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = unsee_tx.send(wire_id).await;
+                        });
+                    }
+                }
+            }
+            maybe_conn = accepted_rx.recv() => {
+                let conn = match maybe_conn {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let wire_id = conn.peer_id().to_string();
+                engaged_wire_ids.insert(wire_id.clone());
+                connected_inbound.insert(wire_id.clone());
+                println!("[mlink] incoming {wire_id} — handshaking...");
+                let accept_result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    node.accept_incoming(conn, transport_label(kind), wire_id.clone()),
+                )
+                .await;
+                let accept_result = match accept_result {
+                    Ok(inner) => inner,
+                    Err(_) => Err(MlinkError::HandlerError(format!(
+                        "accept from {} timed out after {:?}",
+                        wire_id, CONNECT_TIMEOUT
+                    ))),
+                };
+                match accept_result {
+                    Ok(peer_id) => {
+                        println!("[mlink] + {peer_id} (incoming)");
+                        attempts.remove(&wire_id);
+                        peer_names.insert(peer_id.clone(), wire_id.clone());
+                        if !readers.contains_key(&peer_id) {
+                            readers.insert(peer_id.clone(), node.spawn_peer_reader(peer_id));
+                        }
+                    }
+                    Err(MlinkError::RoomMismatch { peer_id }) => {
+                        println!("[mlink] dropped incoming {peer_id}: different room");
+                        engaged_wire_ids.remove(&wire_id);
+                        connected_inbound.remove(&wire_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[mlink] accept {wire_id} failed: {e}");
+                        engaged_wire_ids.remove(&wire_id);
+                        connected_inbound.remove(&wire_id);
+                    }
+                }
+            }
+            ev = events.recv() => {
+                match ev {
+                    Ok(NodeEvent::MessageReceived { peer_id, payload }) => {
+                        let name = peer_names.get(&peer_id).cloned().unwrap_or_else(|| peer_id.clone());
+                        let text = match std::str::from_utf8(&payload) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => format!("<{} bytes binary>", payload.len()),
+                        };
+                        println!("[{name}] {text}");
+                    }
+                    Ok(NodeEvent::PeerConnected { peer_id }) => {
+                        println!("[mlink] peer connected: {peer_id}");
+                    }
+                    Ok(NodeEvent::PeerDisconnected { peer_id }) => {
+                        println!("[mlink] peer disconnected: {peer_id}");
+                        if let Some(h) = readers.remove(&peer_id) {
+                            h.abort();
+                        }
+                    }
+                    Ok(NodeEvent::PeerLost { peer_id }) => {
+                        println!("[mlink] peer lost: {peer_id}");
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    for (_, h) in readers.drain() {
+        h.abort();
+    }
+    node.stop().await?;
+    Ok(())
+}
+
 async fn cmd_room(action: RoomAction, kind: TransportKind) -> Result<(), MlinkError> {
     match action {
         RoomAction::New => {
@@ -500,6 +835,7 @@ async fn cmd_send_room(
     code: String,
     file: Option<PathBuf>,
     message: Option<String>,
+    kind: TransportKind,
 ) -> Result<(), MlinkError> {
     validate_room_code(&code)?;
     if file.is_none() && message.is_none() {
@@ -515,12 +851,19 @@ async fn cmd_send_room(
     // Scanner owns a transport instance and enforces the room-hash filter so
     // we only surface peripherals advertising our room. A second transport is
     // created below for the actual connect path since Scanner takes ownership.
-    let scan_transport = {
-        let mut t = BleTransport::new();
-        t.set_room_hash(room_hash(&code));
-        t
+    let scan_transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => {
+            let mut t = BleTransport::new();
+            t.set_room_hash(room_hash(&code));
+            Box::new(t)
+        }
+        TransportKind::Tcp => {
+            let mut t = TcpTransport::new();
+            t.set_room_hash(room_hash(&code));
+            Box::new(t)
+        }
     };
-    let mut scanner = Scanner::new(Box::new(scan_transport), node.app_uuid().to_string());
+    let mut scanner = Scanner::new(scan_transport, node.app_uuid().to_string());
     scanner.set_room_hashes(vec![room_hash(&code)]);
     let peers = scanner.discover_once().await?;
     if peers.is_empty() {
@@ -531,13 +874,23 @@ async fn cmd_send_room(
     // Separate transport for the connect path (Scanner already consumed the
     // first one). We still filter advertisements via Scanner above, so `peers`
     // here is the room-matched set.
-    let mut transport = BleTransport::new();
-    transport.set_room_hash(room_hash(&code));
+    let mut transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => {
+            let mut t = BleTransport::new();
+            t.set_room_hash(room_hash(&code));
+            Box::new(t)
+        }
+        TransportKind::Tcp => {
+            let mut t = TcpTransport::new();
+            t.set_room_hash(room_hash(&code));
+            Box::new(t)
+        }
+    };
 
     // Connect to every discovered peer in the room, then broadcast.
     let mut connected: Vec<String> = Vec::new();
     for p in &peers {
-        match node.connect_peer(&mut transport, p).await {
+        match node.connect_peer(transport.as_mut(), p).await {
             Ok(peer_id) => connected.push(peer_id),
             Err(e) => eprintln!("[mlink] failed to connect {}: {e}", p.id),
         }
@@ -617,17 +970,22 @@ fn transport_label(kind: TransportKind) -> &'static str {
 
 // ---- legacy peer-id commands ------------------------------------------------
 
-async fn cmd_scan() -> Result<(), MlinkError> {
-    let mut transport = BleTransport::new();
+async fn cmd_scan(kind: TransportKind) -> Result<(), MlinkError> {
+    let mut transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => Box::new(BleTransport::new()),
+        TransportKind::Tcp => Box::new(TcpTransport::new()),
+    };
     let peers = match transport.discover().await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[mlink] scan failed: {e}");
-            print_bluetooth_permission_hint();
+            if matches!(kind, TransportKind::Ble) {
+                print_bluetooth_permission_hint();
+            }
             return Err(e);
         }
     };
-    if peers.is_empty() {
+    if peers.is_empty() && matches!(kind, TransportKind::Ble) {
         print_bluetooth_permission_hint();
     }
     print_peer_list(&peers);
@@ -661,8 +1019,11 @@ fn print_peer_list(peers: &[DiscoveredPeer]) {
     }
 }
 
-async fn cmd_connect(peer_id: String) -> Result<(), MlinkError> {
-    let mut transport = BleTransport::new();
+async fn cmd_connect(peer_id: String, kind: TransportKind) -> Result<(), MlinkError> {
+    let mut transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => Box::new(BleTransport::new()),
+        TransportKind::Tcp => Box::new(TcpTransport::new()),
+    };
     let peers = transport.discover().await?;
     let discovered = peers.into_iter().find(|p| p.id == peer_id).ok_or_else(|| {
         MlinkError::HandlerError(format!("peer {peer_id} not found in scan results"))
@@ -672,14 +1033,17 @@ async fn cmd_connect(peer_id: String) -> Result<(), MlinkError> {
     node.start().await?;
 
     println!("connecting to {peer_id}...");
-    let app_uuid = node.connect_peer(&mut transport, &discovered).await?;
+    let app_uuid = node.connect_peer(transport.as_mut(), &discovered).await?;
     println!("connected (app_uuid={app_uuid})");
     println!("TODO: verification-code prompt for first-time pairing");
     Ok(())
 }
 
-async fn cmd_ping(peer_id: String) -> Result<(), MlinkError> {
-    let mut transport = BleTransport::new();
+async fn cmd_ping(peer_id: String, kind: TransportKind) -> Result<(), MlinkError> {
+    let mut transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => Box::new(BleTransport::new()),
+        TransportKind::Tcp => Box::new(TcpTransport::new()),
+    };
     let peers = transport.discover().await?;
     let discovered = peers.into_iter().find(|p| p.id == peer_id).ok_or_else(|| {
         MlinkError::HandlerError(format!("peer {peer_id} not found in scan results"))
@@ -688,7 +1052,7 @@ async fn cmd_ping(peer_id: String) -> Result<(), MlinkError> {
     let mut node = build_node().await?;
     node.start().await?;
 
-    let app_uuid = node.connect_peer(&mut transport, &discovered).await?;
+    let app_uuid = node.connect_peer(transport.as_mut(), &discovered).await?;
     let start = Instant::now();
     node.send_raw(&app_uuid, MessageType::Heartbeat, &[]).await?;
     let (_frame, _payload) = node.recv_raw(&app_uuid).await?;
@@ -738,24 +1102,48 @@ async fn cmd_trust(action: TrustAction) -> Result<(), MlinkError> {
     Ok(())
 }
 
-async fn cmd_doctor() -> Result<(), MlinkError> {
+async fn cmd_doctor(kind: TransportKind) -> Result<(), MlinkError> {
     println!("mlink doctor");
     println!("  platform:     {}", std::env::consts::OS);
     println!("  architecture: {}", std::env::consts::ARCH);
+    println!("  transport:    {}", transport_label(kind));
 
-    print!("  BLE adapter:  ");
-    let mut transport = BleTransport::new();
-    match transport.discover().await {
-        Ok(peers) => {
-            println!("OK ({} device(s) visible during {}s scan)", peers.len(), 3);
-            if peers.is_empty() {
-                print_bluetooth_permission_hint();
+    match kind {
+        TransportKind::Ble => {
+            print!("  BLE adapter:  ");
+            let mut transport = BleTransport::new();
+            match transport.discover().await {
+                Ok(peers) => {
+                    println!("OK ({} device(s) visible during {}s scan)", peers.len(), 3);
+                    if peers.is_empty() {
+                        print_bluetooth_permission_hint();
+                    }
+                }
+                Err(e) => {
+                    println!("FAIL ({e})");
+                    print_bluetooth_permission_hint();
+                    return Err(e);
+                }
             }
         }
-        Err(e) => {
-            println!("FAIL ({e})");
-            print_bluetooth_permission_hint();
-            return Err(e);
+        TransportKind::Tcp => {
+            print!("  TCP loopback: ");
+            match tcp_loopback_check().await {
+                Ok(port) => println!("OK (bound 127.0.0.1:{port}, round-trip succeeded)"),
+                Err(e) => {
+                    println!("FAIL ({e})");
+                    return Err(e);
+                }
+            }
+
+            print!("  mDNS daemon:  ");
+            match probe_mdns_daemon() {
+                Ok(()) => println!("OK (ServiceDaemon start/shutdown succeeded)"),
+                Err(e) => {
+                    println!("FAIL ({e})");
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -771,6 +1159,30 @@ async fn cmd_doctor() -> Result<(), MlinkError> {
     println!("doctor: all checks passed");
     Ok(())
 }
+
+async fn tcp_loopback_check() -> Result<u16, MlinkError> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| MlinkError::HandlerError(format!("tcp bind 127.0.0.1:0: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| MlinkError::HandlerError(format!("tcp local_addr: {e}")))?;
+    let port = addr.port();
+
+    let accept_task = tokio::spawn(async move {
+        listener.accept().await.map(|_| ())
+    });
+    let _client = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| MlinkError::HandlerError(format!("tcp connect self {addr}: {e}")))?;
+    let accept_result = tokio::time::timeout(Duration::from_secs(2), accept_task)
+        .await
+        .map_err(|_| MlinkError::HandlerError("tcp self-accept timed out".into()))?
+        .map_err(|e| MlinkError::HandlerError(format!("tcp accept task join: {e}")))?;
+    accept_result.map_err(|e| MlinkError::HandlerError(format!("tcp self-accept: {e}")))?;
+    Ok(port)
+}
+
 
 // Silence dead-code warning for `Mutex` import reserved for future daemon wiring.
 #[allow(dead_code)]

@@ -82,6 +82,11 @@ pub enum NodeEvent {
     PeerDisconnected { peer_id: String },
     PeerLost { peer_id: String },
     Reconnecting { peer_id: String, attempt: u32 },
+    /// A `MessageType::Message` frame arrived from `peer_id`. Payload is the
+    /// decoded, decrypted, decompressed bytes. Only emitted for peers whose
+    /// connection is being drained by the background reader spawned by
+    /// `Node::spawn_peer_reader`.
+    MessageReceived { peer_id: String, payload: Vec<u8> },
 }
 
 /// Top-level mlink endpoint: owns peers, connections, trust store, and events.
@@ -481,6 +486,46 @@ impl Node {
         conn.write(&bytes).await
     }
 
+    /// Start a background task that drains messages from `peer_id` and
+    /// publishes each `MessageType::Message` frame as a
+    /// `NodeEvent::MessageReceived`. The task exits on the first read error
+    /// (e.g. peer disconnect) after emitting `NodeEvent::PeerDisconnected` —
+    /// it does *not* attempt to reconnect.
+    ///
+    /// Must be called after a successful `connect_peer` / `accept_incoming`
+    /// for that peer; otherwise the reader will immediately see `PeerGone`
+    /// and exit.
+    pub fn spawn_peer_reader(&self, peer_id: String) -> tokio::task::JoinHandle<()> {
+        let connections = Arc::clone(&self.connections);
+        let peer_states = Arc::clone(&self.peer_states);
+        let events_tx = self.events_tx.clone();
+        let encrypt = self.config.encrypt;
+        tokio::spawn(async move {
+            loop {
+                let res = recv_once(&connections, &peer_states, encrypt, &peer_id).await;
+                match res {
+                    Ok((msg_type, payload)) => {
+                        if msg_type == MessageType::Message {
+                            let _ = events_tx.send(NodeEvent::MessageReceived {
+                                peer_id: peer_id.clone(),
+                                payload,
+                            });
+                        }
+                        // Heartbeats and other control frames are consumed
+                        // silently — `recv_once` already refreshed the
+                        // last-heartbeat timestamp.
+                    }
+                    Err(_) => {
+                        let _ = events_tx.send(NodeEvent::PeerDisconnected {
+                            peer_id: peer_id.clone(),
+                        });
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
     pub async fn recv_raw(&self, peer_id: &str) -> Result<(Frame, Vec<u8>)> {
         let bytes = {
             let mut guard = self.connections.lock().await;
@@ -579,6 +624,56 @@ impl Node {
     pub fn trust_store(&self) -> Arc<RwLock<TrustStore>> {
         Arc::clone(&self.trust_store)
     }
+}
+
+/// Read-decode-decrypt-decompress a single frame for the given peer using only
+/// the shared state handles (no `&Node` needed). Extracted so
+/// `spawn_peer_reader` can run in a background task without borrowing the
+/// parent Node. Returns the message type plus the plaintext payload.
+async fn recv_once(
+    connections: &Arc<Mutex<ConnectionManager>>,
+    peer_states: &Arc<RwLock<HashMap<String, PeerState>>>,
+    encrypt: bool,
+    peer_id: &str,
+) -> Result<(MessageType, Vec<u8>)> {
+    let bytes = {
+        let mut guard = connections.lock().await;
+        let conn = guard
+            .get_mut(peer_id)
+            .await
+            .ok_or_else(|| MlinkError::PeerGone {
+                peer_id: peer_id.to_string(),
+            })?;
+        conn.read().await?
+    };
+
+    let frame = decode_frame(&bytes)?;
+    let (compressed, encrypted, msg_type) = decode_flags(frame.flags);
+
+    let mut payload = frame.payload.clone();
+
+    if encrypted && encrypt {
+        let states = peer_states.read().await;
+        let st = states.get(peer_id).ok_or_else(|| MlinkError::PeerGone {
+            peer_id: peer_id.to_string(),
+        })?;
+        if let Some(key) = &st.aes_key {
+            payload = crate::core::security::decrypt(&payload, key, frame.seq)?;
+        }
+    }
+
+    if compressed {
+        payload = decompress(&payload)?;
+    }
+
+    if msg_type == MessageType::Heartbeat {
+        let mut states = peer_states.write().await;
+        if let Some(s) = states.get_mut(peer_id) {
+            s.last_heartbeat = Some(Instant::now());
+        }
+    }
+
+    Ok((msg_type, payload))
 }
 
 #[cfg(test)]
@@ -884,5 +979,56 @@ mod tests {
         let frame = crate::protocol::frame::decode_frame(&bytes).expect("decode");
         let (_, _, mt) = crate::protocol::types::decode_flags(frame.flags);
         assert_eq!(mt, MessageType::Message);
+    }
+
+    #[tokio::test]
+    async fn spawn_peer_reader_emits_message_received_event() {
+        // Wire two Nodes via a mock pair, attach the connections on both ends,
+        // spawn a reader on one side, send a Message from the other, and
+        // assert the event surfaces on the broadcast channel.
+        let _tmp = set_tmp_home();
+        let tmp_a = tempfile::tempdir().expect("tmp-a");
+        let tmp_b = tempfile::tempdir().expect("tmp-b");
+        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+            .await
+            .expect("new a");
+        let mut node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+            .await
+            .expect("new b");
+
+        let (a_conn, b_conn) = crate::transport::mock::mock_pair();
+        node_a.attach_connection("peer-b".into(), Box::new(a_conn)).await;
+        node_b.attach_connection("peer-a".into(), Box::new(b_conn)).await;
+
+        // Subscribe BEFORE spawning so we don't miss the event.
+        let mut events = node_a.subscribe();
+        let handle = node_a.spawn_peer_reader("peer-b".into());
+
+        // Send a Message frame from node_b → node_a.
+        node_b
+            .send_raw("peer-a", MessageType::Message, b"hello chat")
+            .await
+            .expect("send");
+
+        // Drain events until we see MessageReceived or time out.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if timeout.is_zero() {
+                panic!("timed out waiting for MessageReceived event");
+            }
+            match tokio::time::timeout(timeout, events.recv()).await {
+                Ok(Ok(NodeEvent::MessageReceived { peer_id, payload })) => {
+                    assert_eq!(peer_id, "peer-b");
+                    assert_eq!(payload, b"hello chat".to_vec());
+                    break;
+                }
+                Ok(Ok(_)) => continue, // ignore PeerConnected noise from attach
+                Ok(Err(_)) => panic!("event stream closed"),
+                Err(_) => panic!("timeout waiting for MessageReceived"),
+            }
+        }
+
+        handle.abort();
     }
 }

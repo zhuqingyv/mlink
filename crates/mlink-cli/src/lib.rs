@@ -79,6 +79,11 @@ pub enum Commands {
     },
     /// Listen on all joined rooms and print messages as they arrive
     Listen,
+    /// Interactive chat: join a room, print incoming messages, broadcast each stdin line
+    Chat {
+        /// 6-digit room code
+        code: String,
+    },
 
     // ---- legacy peer-id commands (still supported) --------------------------
     /// Scan for nearby mlink devices
