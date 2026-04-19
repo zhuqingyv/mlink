@@ -55,7 +55,31 @@ type EventReceiver = mpsc::UnboundedReceiver<PeripheralEvent>;
 /// Centrals currently subscribed to the RX characteristic. Wrapped in a `std`
 /// Mutex (not tokio) because we mutate it from Obj-C delegate callbacks which
 /// are non-async.
-type SubscribedCentrals = StdMutex<Vec<Retained<CBCentral>>>;
+///
+/// `Retained<CBCentral>` is not `Send`, but we only access this vec under the
+/// mutex and we never hand out raw refs to other threads, so the same Send
+/// reasoning as for `MacPeripheral` applies. A newtype lets us declare `Send`
+/// explicitly and keep the async state machine Send-clean when an Arc of this
+/// crosses `.await` points during setup.
+struct SubscribedCentralsInner(StdMutex<Vec<Retained<CBCentral>>>);
+
+// SAFETY: see the doc comment above — access is mutex-guarded and confined.
+unsafe impl Send for SubscribedCentralsInner {}
+unsafe impl Sync for SubscribedCentralsInner {}
+
+impl SubscribedCentralsInner {
+    fn new() -> Self {
+        Self(StdMutex::new(Vec::new()))
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, Vec<Retained<CBCentral>>>> {
+        self.0.lock()
+    }
+}
+
+type SubscribedCentrals = SubscribedCentralsInner;
 
 /// The macOS peripheral. Holds strong references to the CoreBluetooth objects
 /// so they stay alive for the lifetime of the advertisement.
@@ -82,57 +106,113 @@ impl MacPeripheral {
     ) -> Result<Self> {
         let local_name = local_name.into();
 
-        let (tx, rx) = mpsc::unbounded_channel::<PeripheralEvent>();
-        let subscribed: Arc<SubscribedCentrals> = Arc::new(StdMutex::new(Vec::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel::<PeripheralEvent>();
+        let subscribed: Arc<SubscribedCentrals> = Arc::new(SubscribedCentralsInner::new());
 
-        // Service + characteristics.
-        let service = build_service()?;
-        let tx_char = build_characteristic(TX_CHAR_UUID, WRITE_PERMISSIONS, write_properties())?;
-        let rx_char = build_characteristic(RX_CHAR_UUID, READ_PERMISSIONS, notify_properties())?;
-        let ctrl_char =
-            build_characteristic(CTRL_CHAR_UUID, RW_PERMISSIONS, read_write_properties())?;
-
-        attach_characteristics(&service, &[&tx_char, &rx_char, &ctrl_char]);
-
-        // Create the delegate. It owns clones of the sender and the subscribed
-        // list; CoreBluetooth will retain the delegate via initWithDelegate:.
-        let delegate = MlinkPeripheralDelegate::new(DelegateIvars {
-            tx: tx.clone(),
-            subscribed: subscribed.clone(),
-            rx_char_uuid: RX_CHAR_UUID,
-        });
-
-        // Create the peripheral manager on the default queue (nil = main in CB).
-        // `initWithDelegate:queue:` takes an Obj-C protocol object for the
-        // delegate; we upcast our concrete delegate into its protocol form.
-        let delegate_proto: &ProtocolObject<dyn CBPeripheralManagerDelegate> =
-            ProtocolObject::from_ref(&*delegate);
-        let manager: Retained<CBPeripheralManager> = unsafe {
-            let alloc = CBPeripheralManager::alloc();
-            msg_send_id![alloc, initWithDelegate: delegate_proto, queue: std::ptr::null::<AnyObject>()]
-        };
-
-        // Register the service. This is async in CoreBluetooth; real completion
-        // arrives via peripheralManager:didAddService:error:.
-        unsafe {
-            manager.addService(&service);
-        }
-
-        // Build advertisement data: service UUIDs + local name. manufacturer
-        // data for room_hash would ideally go under
-        // CBAdvertisementDataManufacturerDataKey but that key is iOS-only and
-        // not honored on macOS peripheral side; we encode the hash into the
-        // local name suffix as a pragmatic fallback (8 bytes → 16 hex chars).
         let advertised_name = match room_hash {
             Some(h) => format!("{local_name}#{}", hex_encode(&h)),
             None => local_name.clone(),
         };
 
-        let ad_dict = build_advertisement_data(&advertised_name)?;
-
-        unsafe {
-            manager.startAdvertising(Some(&ad_dict));
+        // All CoreBluetooth Retained values are !Send. The Transport trait
+        // requires the returned future to be Send, so we pack every Retained
+        // object used during setup into a holder we've declared Send (mirroring
+        // the existing `unsafe impl Send for MacPeripheral`). This keeps the
+        // async state machine Send-clean even though we cross .await points
+        // while holding onto these objects.
+        struct SetupHolder {
+            manager: Retained<CBPeripheralManager>,
+            service: Retained<CBMutableService>,
+            tx_char: Retained<CBMutableCharacteristic>,
+            rx_char: Retained<CBMutableCharacteristic>,
+            ctrl_char: Retained<CBMutableCharacteristic>,
+            delegate: Retained<MlinkPeripheralDelegate>,
+            ad_dict: Retained<NSDictionary<NSString, AnyObject>>,
         }
+        // SAFETY: same reasoning as `unsafe impl Send for MacPeripheral` —
+        // every Retained access goes through an explicit `unsafe` block and we
+        // do not share references across threads concurrently during setup.
+        unsafe impl Send for SetupHolder {}
+
+        let holder: SetupHolder = {
+            let service = build_service()?;
+            let tx_char =
+                build_characteristic(TX_CHAR_UUID, WRITE_PERMISSIONS, write_properties())?;
+            let rx_char =
+                build_characteristic(RX_CHAR_UUID, READ_PERMISSIONS, notify_properties())?;
+            let ctrl_char =
+                build_characteristic(CTRL_CHAR_UUID, RW_PERMISSIONS, read_write_properties())?;
+
+            attach_characteristics(&service, &[&tx_char, &rx_char, &ctrl_char]);
+
+            let delegate = MlinkPeripheralDelegate::new(DelegateIvars {
+                tx: tx.clone(),
+                subscribed: subscribed.clone(),
+                rx_char_uuid: RX_CHAR_UUID,
+            });
+
+            let delegate_proto: &ProtocolObject<dyn CBPeripheralManagerDelegate> =
+                ProtocolObject::from_ref(&*delegate);
+            eprintln!("[mlink:periph] creating CBPeripheralManager");
+            let manager: Retained<CBPeripheralManager> = unsafe {
+                let alloc = CBPeripheralManager::alloc();
+                msg_send_id![alloc, initWithDelegate: delegate_proto, queue: std::ptr::null::<AnyObject>()]
+            };
+
+            let ad_dict = build_advertisement_data(&advertised_name)?;
+
+            SetupHolder {
+                manager,
+                service,
+                tx_char,
+                rx_char,
+                ctrl_char,
+                delegate,
+                ad_dict,
+            }
+        };
+
+        // CoreBluetooth rejects addService / startAdvertising until the manager
+        // transitions to PoweredOn. Wait for that state change before touching
+        // either. Without this, addService silently no-ops and the service is
+        // never included in the broadcast, which is exactly the bug that sent
+        // centrals into discover_services empty-handed.
+        wait_for_powered_on(&mut rx).await?;
+
+        // Register the service. This is async in CoreBluetooth; real completion
+        // arrives via peripheralManager:didAddService:error:. startAdvertising
+        // MUST be deferred until after that callback — otherwise the service
+        // is not yet part of the GATT DB and the advertisement goes out without
+        // it.
+        eprintln!(
+            "[mlink:periph] addService uuid={} chars={}",
+            MLINK_SERVICE_UUID, 3
+        );
+        unsafe {
+            holder.manager.addService(&holder.service);
+        }
+
+        wait_for_service_added(&mut rx).await?;
+
+        eprintln!(
+            "[mlink:periph] startAdvertising name={:?}",
+            advertised_name
+        );
+        unsafe {
+            holder.manager.startAdvertising(Some(&holder.ad_dict));
+        }
+
+        wait_for_advertising_started(&mut rx).await?;
+
+        let SetupHolder {
+            manager,
+            service,
+            tx_char,
+            rx_char,
+            ctrl_char,
+            delegate,
+            ad_dict: _,
+        } = holder;
 
         // Keep the sender alive across the lifetime of the peripheral. The
         // delegate holds its own clone, but we also keep one here for any
@@ -266,6 +346,7 @@ declare_class!(
         #[method(peripheralManagerDidUpdateState:)]
         fn peripheral_manager_did_update_state(&self, peripheral: &CBPeripheralManager) {
             let state = unsafe { peripheral.state() };
+            eprintln!("[mlink:periph] delegate: didUpdateState -> {:?}", state);
             let _ = self.ivars().tx.send(PeripheralEvent::StateChanged(state));
         }
 
@@ -276,8 +357,15 @@ declare_class!(
             error: Option<&NSError>,
         ) {
             let res = match error {
-                None => Ok(()),
-                Some(e) => Err(format!("{}", e.localizedDescription())),
+                None => {
+                    eprintln!("[mlink:periph] delegate: didStartAdvertising OK");
+                    Ok(())
+                }
+                Some(e) => {
+                    let msg = format!("{}", e.localizedDescription());
+                    eprintln!("[mlink:periph] delegate: didStartAdvertising ERR {}", msg);
+                    Err(msg)
+                }
             };
             let _ = self.ivars().tx.send(PeripheralEvent::AdvertisingStarted(res));
         }
@@ -286,12 +374,29 @@ declare_class!(
         fn peripheral_manager_did_add_service_error(
             &self,
             _peripheral: &CBPeripheralManager,
-            _service: &CBService,
+            service: &CBService,
             error: Option<&NSError>,
         ) {
             let res = match error {
-                None => Ok(()),
-                Some(e) => Err(format!("{}", e.localizedDescription())),
+                None => {
+                    let uuid = unsafe { service.UUID().UUIDString().to_string() };
+                    let chars_count = unsafe {
+                        service
+                            .characteristics()
+                            .map(|arr| arr.len())
+                            .unwrap_or(0)
+                    };
+                    eprintln!(
+                        "[mlink:periph] delegate: didAddService OK uuid={} chars={}",
+                        uuid, chars_count
+                    );
+                    Ok(())
+                }
+                Some(e) => {
+                    let msg = format!("{}", e.localizedDescription());
+                    eprintln!("[mlink:periph] delegate: didAddService ERR {}", msg);
+                    Err(msg)
+                }
             };
             let _ = self.ivars().tx.send(PeripheralEvent::ServiceAdded(res));
         }
@@ -395,6 +500,123 @@ fn uuid_matches(uuid_str: &str, expected: &Uuid) -> bool {
     // sufficient.
     let needle = expected.to_string();
     uuid_str.eq_ignore_ascii_case(&needle)
+}
+
+// ---------- bring-up sequencing ----------
+
+/// Timeout for each CoreBluetooth bring-up step. 10 s is long enough to wait
+/// for user-visible permission prompts on first launch, but short enough that
+/// a misconfigured manager fails fast instead of hanging the caller forever.
+const BRING_UP_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn wait_for_powered_on(rx: &mut EventReceiver) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + BRING_UP_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Err(_) => {
+                return Err(MlinkError::HandlerError(
+                    "CBPeripheralManager never reached PoweredOn within 10s".into(),
+                ));
+            }
+            Ok(None) => {
+                return Err(MlinkError::HandlerError(
+                    "peripheral event channel closed before PoweredOn".into(),
+                ));
+            }
+            Ok(Some(PeripheralEvent::StateChanged(state))) => {
+                eprintln!("[mlink:periph] state changed -> {:?}", state);
+                if state == CBManagerState::PoweredOn {
+                    return Ok(());
+                }
+                if state == CBManagerState::Unauthorized
+                    || state == CBManagerState::Unsupported
+                    || state == CBManagerState::PoweredOff
+                {
+                    return Err(MlinkError::HandlerError(format!(
+                        "CBPeripheralManager in non-usable state {:?}",
+                        state
+                    )));
+                }
+            }
+            Ok(Some(other)) => {
+                eprintln!(
+                    "[mlink:periph] unexpected event before PoweredOn: {:?}",
+                    other
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_service_added(rx: &mut EventReceiver) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + BRING_UP_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Err(_) => {
+                return Err(MlinkError::HandlerError(
+                    "didAddService callback never fired within 10s".into(),
+                ));
+            }
+            Ok(None) => {
+                return Err(MlinkError::HandlerError(
+                    "peripheral event channel closed before didAddService".into(),
+                ));
+            }
+            Ok(Some(PeripheralEvent::ServiceAdded(Ok(())))) => {
+                eprintln!("[mlink:periph] didAddService OK");
+                return Ok(());
+            }
+            Ok(Some(PeripheralEvent::ServiceAdded(Err(msg)))) => {
+                eprintln!("[mlink:periph] didAddService FAILED: {}", msg);
+                return Err(MlinkError::HandlerError(format!(
+                    "addService failed: {msg}"
+                )));
+            }
+            Ok(Some(other)) => {
+                eprintln!(
+                    "[mlink:periph] unexpected event while awaiting didAddService: {:?}",
+                    other
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_advertising_started(rx: &mut EventReceiver) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + BRING_UP_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Err(_) => {
+                return Err(MlinkError::HandlerError(
+                    "didStartAdvertising callback never fired within 10s".into(),
+                ));
+            }
+            Ok(None) => {
+                return Err(MlinkError::HandlerError(
+                    "peripheral event channel closed before didStartAdvertising".into(),
+                ));
+            }
+            Ok(Some(PeripheralEvent::AdvertisingStarted(Ok(())))) => {
+                eprintln!("[mlink:periph] didStartAdvertising OK");
+                return Ok(());
+            }
+            Ok(Some(PeripheralEvent::AdvertisingStarted(Err(msg)))) => {
+                eprintln!("[mlink:periph] didStartAdvertising FAILED: {}", msg);
+                return Err(MlinkError::HandlerError(format!(
+                    "startAdvertising failed: {msg}"
+                )));
+            }
+            Ok(Some(other)) => {
+                eprintln!(
+                    "[mlink:periph] unexpected event while awaiting didStartAdvertising: {:?}",
+                    other
+                );
+            }
+        }
+    }
 }
 
 // ---------- helpers ----------
