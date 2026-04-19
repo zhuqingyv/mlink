@@ -136,9 +136,7 @@ impl Transport for BleTransport {
     async fn discover(&mut self) -> Result<Vec<DiscoveredPeer>> {
         let scan_duration = self.scan_duration;
         let adapter = self.ensure_adapter().await?;
-        let filter = ScanFilter {
-            services: vec![MLINK_SERVICE_UUID],
-        };
+        let filter = ScanFilter { services: vec![] };
         adapter.start_scan(filter).await?;
         tokio::time::sleep(scan_duration).await;
         let peripherals = adapter.peripherals().await?;
@@ -150,25 +148,13 @@ impl Transport for BleTransport {
                 Some(p) => p,
                 None => continue,
             };
-            if !props.services.contains(&MLINK_SERVICE_UUID) {
-                continue;
-            }
-            let raw_name = props.local_name.unwrap_or_else(|| p.id().to_string());
-            // macOS can't set manufacturer_data in peripheral-role advertisements,
-            // so peripherals encode the room hash into the advertised name as
-            // `<name>#<16 hex>`. Parse it back out so Scanner can filter by room.
-            // Fall back to manufacturer_data for iOS/Linux peripherals.
+            let raw_name = match props.local_name {
+                Some(n) => n,
+                None => continue,
+            };
             let (name, metadata) = match parse_room_hash_from_name(&raw_name) {
                 Some((base, hash)) => (base, hash.to_vec()),
-                None => {
-                    let md = props
-                        .manufacturer_data
-                        .values()
-                        .next()
-                        .cloned()
-                        .unwrap_or_default();
-                    (raw_name, md)
-                }
+                None => continue,
             };
             out.push(DiscoveredPeer {
                 id: p.id().to_string(),
