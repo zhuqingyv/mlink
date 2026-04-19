@@ -191,6 +191,7 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
         TransportKind::Tcp => {
             let mut listen_transport = TcpTransport::new();
             listen_transport.set_local_name(local_name.clone());
+            listen_transport.set_app_uuid(node.app_uuid().to_string());
             if let Some(h) = room_hash_bytes {
                 listen_transport.set_room_hash(h);
             }
@@ -231,6 +232,7 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
             TransportKind::Tcp => {
                 let mut t = TcpTransport::new();
                 t.set_room_hash(hash);
+                t.set_app_uuid(app_uuid.clone());
                 Box::new(t)
             }
         };
@@ -508,6 +510,7 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
         TransportKind::Tcp => {
             let mut listen_transport = TcpTransport::new();
             listen_transport.set_local_name(local_name.clone());
+            listen_transport.set_app_uuid(node.app_uuid().to_string());
             listen_transport.set_room_hash(hash);
             tokio::spawn(async move {
                 loop {
@@ -541,6 +544,7 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
             TransportKind::Tcp => {
                 let mut t = TcpTransport::new();
                 t.set_room_hash(hash);
+                t.set_app_uuid(app_uuid.clone());
                 Box::new(t)
             }
         };

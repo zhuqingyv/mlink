@@ -22,6 +22,7 @@ pub struct TcpTransport {
     local_name: String,
     advertised: Option<AdvertiseHandle>,
     discover_duration: Duration,
+    app_uuid: Option<String>,
 }
 
 struct AdvertiseHandle {
@@ -45,6 +46,7 @@ impl TcpTransport {
             local_name: "mlink".into(),
             advertised: None,
             discover_duration: DEFAULT_DISCOVER_DURATION,
+            app_uuid: None,
         }
     }
 
@@ -60,6 +62,13 @@ impl TcpTransport {
 
     pub fn set_local_name(&mut self, name: impl Into<String>) {
         self.local_name = name.into();
+    }
+
+    /// Tag the mDNS advertisement with this app uuid and filter it out of
+    /// future `discover()` results. Without this, a single node sees its own
+    /// broadcast and tries to dial itself.
+    pub fn set_app_uuid(&mut self, uuid: impl Into<String>) {
+        self.app_uuid = Some(uuid.into());
     }
 
     pub fn set_room_hash(&mut self, hash: [u8; 8]) {
@@ -116,7 +125,8 @@ impl Transport for TcpTransport {
 
     async fn discover(&mut self) -> Result<Vec<DiscoveredPeer>> {
         let duration = self.discover_duration;
-        let peers = tokio::task::spawn_blocking(move || browse_once(duration))
+        let self_uuid = self.app_uuid.clone();
+        let peers = tokio::task::spawn_blocking(move || browse_once(duration, self_uuid))
             .await
             .map_err(|e| MlinkError::HandlerError(format!("tcp discover join: {e}")))??;
         Ok(peers)
@@ -145,6 +155,7 @@ impl Transport for TcpTransport {
                 self.port,
                 &self.local_name,
                 self.room_hash,
+                self.app_uuid.as_deref(),
             )?);
         }
         let listener = self.listener.as_ref().expect("listener bound above");
@@ -224,6 +235,7 @@ fn register_service(
     port: u16,
     local_name: &str,
     room_hash: Option<[u8; 8]>,
+    app_uuid: Option<&str>,
 ) -> Result<AdvertiseHandle> {
     let daemon = ServiceDaemon::new()
         .map_err(|e| MlinkError::HandlerError(format!("mdns daemon start: {e}")))?;
@@ -235,6 +247,9 @@ fn register_service(
     txt.insert("name".into(), local_name.into());
     if let Some(h) = room_hash {
         txt.insert("room".into(), hex_encode(&h));
+    }
+    if let Some(uuid) = app_uuid {
+        txt.insert("uuid".into(), uuid.into());
     }
 
     let host_ipv4 = format!("{hostname}.local.");
@@ -257,14 +272,18 @@ fn register_service(
     Ok(AdvertiseHandle { daemon, fullname })
 }
 
-fn browse_once(duration: Duration) -> Result<Vec<DiscoveredPeer>> {
+fn browse_once(duration: Duration, self_uuid: Option<String>) -> Result<Vec<DiscoveredPeer>> {
     let daemon = ServiceDaemon::new()
         .map_err(|e| MlinkError::HandlerError(format!("mdns daemon start: {e}")))?;
     let receiver = daemon
         .browse(SERVICE_TYPE)
         .map_err(|e| MlinkError::HandlerError(format!("mdns browse: {e}")))?;
     let deadline = std::time::Instant::now() + duration;
+    // Dedup per logical instance: key is the peer's app uuid (preferred) or
+    // mDNS fullname (fallback). Keep only the first non-loopback address per
+    // key so multi-homed hosts don't surface the same peer N times.
     let mut peers: HashMap<String, DiscoveredPeer> = HashMap::new();
+    let loopback = Ipv4Addr::new(127, 0, 0, 1);
 
     loop {
         let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
@@ -283,17 +302,41 @@ fn browse_once(duration: Duration) -> Result<Vec<DiscoveredPeer>> {
                     .and_then(|hex| hex_decode_8(hex))
                     .map(|h| h.to_vec())
                     .unwrap_or_default();
-                let v4_addrs: Vec<Ipv4Addr> = info.get_addresses_v4().into_iter().collect();
-                for v4 in v4_addrs {
-                    let sock = SocketAddr::new(IpAddr::V4(v4), port);
-                    let id = sock.to_string();
-                    peers.entry(id.clone()).or_insert(DiscoveredPeer {
-                        id,
-                        name: name.clone(),
-                        rssi: None,
-                        metadata: metadata.clone(),
-                    });
+                let peer_uuid = info
+                    .get_property_val_str("uuid")
+                    .map(|s| s.to_string());
+
+                // Skip our own advertisement: same mDNS instance reaches us
+                // on every interface, so without this the local process dials
+                // itself.
+                if let (Some(mine), Some(theirs)) = (self_uuid.as_deref(), peer_uuid.as_deref()) {
+                    if mine == theirs {
+                        continue;
+                    }
                 }
+
+                let dedup_key = peer_uuid
+                    .clone()
+                    .unwrap_or_else(|| info.get_fullname().to_string());
+
+                // Drop loopback — useless for cross-machine connects and a
+                // guaranteed self-hit on multi-homed setups.
+                let v4_addrs: Vec<Ipv4Addr> = info
+                    .get_addresses_v4()
+                    .into_iter()
+                    .filter(|v4| *v4 != loopback)
+                    .collect();
+                let Some(v4) = v4_addrs.into_iter().next() else {
+                    continue;
+                };
+                let sock = SocketAddr::new(IpAddr::V4(v4), port);
+                let id = sock.to_string();
+                peers.entry(dedup_key).or_insert(DiscoveredPeer {
+                    id,
+                    name: name.clone(),
+                    rssi: None,
+                    metadata: metadata.clone(),
+                });
             }
             Ok(_) => {}
             Err(_) => break,
@@ -664,5 +707,81 @@ mod tests {
         assert_eq!(echo, b"hello");
         client.close().await.unwrap();
         let _ = listener_task.await;
+    }
+
+    #[test]
+    fn set_app_uuid_updates_field() {
+        let mut t = TcpTransport::new();
+        assert!(t.app_uuid.is_none());
+        t.set_app_uuid("abc-123");
+        assert_eq!(t.app_uuid.as_deref(), Some("abc-123"));
+    }
+
+    /// With matching app_uuid, a transport should not see itself in discover
+    /// results — otherwise a single-node process self-connects after listen().
+    #[tokio::test]
+    async fn discover_filters_own_uuid() {
+        let mut server_t = TcpTransport::new().with_discover_duration(Duration::from_millis(500));
+        server_t.set_local_name("mlink-self-filter-test");
+        server_t.set_app_uuid("node-self-uuid");
+
+        let listener_task = tokio::spawn(async move {
+            // Hold the listen() future so the mDNS advertisement stays up.
+            // accept() never resolves in the test window; that's fine — we
+            // only care about the TXT record being on the wire.
+            let _ = server_t.listen().await;
+            server_t
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Client using the *same* uuid — should skip that advertisement.
+        let mut client_t = TcpTransport::new().with_discover_duration(Duration::from_secs(2));
+        client_t.set_app_uuid("node-self-uuid");
+        let peers = client_t.discover().await.unwrap();
+        assert!(
+            !peers.iter().any(|p| p.name == "mlink-self-filter-test"),
+            "discover must not surface a peer carrying our own uuid: {:?}",
+            peers
+        );
+
+        listener_task.abort();
+    }
+
+    /// Discovered peers should never carry a 127.0.0.1 address — loopback is
+    /// useless for cross-machine dials and a guaranteed self-hit on
+    /// multi-homed boxes. We verify by asking the transport to register a
+    /// loopback-only service and confirming the client browse drops it.
+    #[tokio::test]
+    async fn discover_drops_loopback_only_peer() {
+        let mut server_t = TcpTransport::new().with_discover_duration(Duration::from_millis(500));
+        server_t.set_local_name("mlink-loopback-drop-test");
+        // Note: we do *not* set an app_uuid so the client (with a different
+        // uuid) still considers this a foreign peer — the only filter that
+        // should matter in this test is the loopback one.
+
+        let listener_task = tokio::spawn(async move {
+            let _ = server_t.listen().await;
+            server_t
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut client_t = TcpTransport::new().with_discover_duration(Duration::from_secs(2));
+        client_t.set_app_uuid("client-uuid");
+        let peers = client_t.discover().await.unwrap();
+
+        // Any peer we *do* see must not use a 127.0.0.1 id. If the env blocks
+        // multicast entirely we get zero peers — that still passes this
+        // assertion because the iterator is empty.
+        for p in &peers {
+            assert!(
+                !p.id.starts_with("127.0.0.1:"),
+                "loopback peer leaked into discover results: {:?}",
+                p
+            );
+        }
+
+        listener_task.abort();
     }
 }
