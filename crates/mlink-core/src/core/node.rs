@@ -189,6 +189,14 @@ impl Node {
         guard.get(id).map(|s| s.state)
     }
 
+    /// True if we already hold a live connection keyed by `app_uuid`. Used by
+    /// the CLI/serve loop (and internally here) to keep a second dial from
+    /// racing a connection that has already completed its handshake.
+    pub async fn has_peer(&self, app_uuid: &str) -> bool {
+        let guard = self.connections.lock().await;
+        guard.get(app_uuid).await.is_some()
+    }
+
     pub async fn connect_peer(
         &mut self,
         transport: &mut dyn Transport,
@@ -270,6 +278,25 @@ impl Node {
         }
 
         let peer_id = peer_hs.app_uuid.clone();
+
+        // Idempotency: if we already hold a live connection for this app_uuid
+        // (because the peer dialled us inbound while we were dialling out, or
+        // the scanner surfaced the same peer twice), drop the new connection
+        // and return the existing peer_id. Installing the duplicate would kick
+        // the working one out of ConnectionManager and tear down the live link.
+        {
+            let guard = self.connections.lock().await;
+            if guard.get(&peer_id).await.is_some() {
+                drop(guard);
+                eprintln!(
+                    "[mlink:conn] node.connect_peer DEDUP peer={} already connected — closing new dial",
+                    peer_id
+                );
+                let _ = conn.close().await;
+                return Ok(peer_id);
+            }
+        }
+
         let peer = Peer {
             id: peer_id.clone(),
             name: discovered.name.clone(),
@@ -366,6 +393,23 @@ impl Node {
         }
 
         let peer_id = peer_hs.app_uuid.clone();
+
+        // Idempotency: see `connect_peer`. If the outbound dial already won
+        // the race, drop this inbound duplicate instead of evicting the live
+        // connection. Returning Ok lets the caller treat it as a no-op.
+        {
+            let guard = self.connections.lock().await;
+            if guard.get(&peer_id).await.is_some() {
+                drop(guard);
+                eprintln!(
+                    "[mlink:conn] node.accept_incoming DEDUP peer={} already connected — closing duplicate",
+                    peer_id
+                );
+                let _ = conn.close().await;
+                return Ok(peer_id);
+            }
+        }
+
         let peer = Peer {
             id: peer_id.clone(),
             name: fallback_name,
@@ -979,6 +1023,75 @@ mod tests {
         let frame = crate::protocol::frame::decode_frame(&bytes).expect("decode");
         let (_, _, mt) = crate::protocol::types::decode_flags(frame.flags);
         assert_eq!(mt, MessageType::Message);
+    }
+
+    #[tokio::test]
+    async fn accept_incoming_is_idempotent_when_already_connected() {
+        // Scenario: outbound dial already finished (attach_connection simulates
+        // the post-handshake registration). A duplicate inbound arrives for the
+        // same app_uuid. accept_incoming must close the duplicate and return
+        // Ok(existing_id) instead of evicting the live connection.
+        let _tmp = set_tmp_home();
+        let tmp_a = tempfile::tempdir().expect("tmp-a");
+        let tmp_b = tempfile::tempdir().expect("tmp-b");
+        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+            .await
+            .expect("new a");
+        let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+            .await
+            .expect("new b");
+        let peer_b_id = node_b.app_uuid().to_string();
+
+        // Pretend node_b is already connected via the outbound path.
+        let (existing, _drop_peer) = crate::transport::mock::mock_pair();
+        node_a
+            .attach_connection(peer_b_id.clone(), Box::new(existing))
+            .await;
+        assert_eq!(node_a.connection_count().await, 1);
+        assert!(node_a.has_peer(&peer_b_id).await);
+
+        // Now simulate an inbound duplicate from the same peer: run a
+        // handshake on the duplicate pair; accept_incoming should DEDUP.
+        let (ca, cb) = crate::transport::mock::mock_pair();
+        let hs_b = Handshake {
+            app_uuid: peer_b_id.clone(),
+            version: PROTOCOL_VERSION,
+            mtu: 512,
+            compress: true,
+            encrypt: false,
+            last_seq: 0,
+            resume_streams: vec![],
+            room_hash: None,
+        };
+        let driver = tokio::spawn(async move {
+            let mut cb: Box<dyn Connection> = Box::new(cb);
+            let _ = perform_handshake(cb.as_mut(), &hs_b).await;
+        });
+
+        let got = node_a
+            .accept_incoming(Box::new(ca), "mock", "dup".into())
+            .await
+            .expect("dedup accept returns Ok");
+        let _ = driver.await;
+
+        assert_eq!(got, peer_b_id);
+        // Still exactly one connection — the duplicate was dropped.
+        assert_eq!(node_a.connection_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn has_peer_tracks_attach_and_disconnect() {
+        let _tmp = set_tmp_home();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut node = Node::new(tmp_config(tmp.path().join("t.json")))
+            .await
+            .expect("new");
+        assert!(!node.has_peer("peer-x").await);
+        let (a, _b) = crate::transport::mock::mock_pair();
+        node.attach_connection("peer-x".into(), Box::new(a)).await;
+        assert!(node.has_peer("peer-x").await);
+        node.disconnect_peer("peer-x").await.expect("disc");
+        assert!(!node.has_peer("peer-x").await);
     }
 
     #[tokio::test]

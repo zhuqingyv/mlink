@@ -273,6 +273,16 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
     // dialling them. We must not then also dial — that would race and tear
     // down the live inbound link.
     let mut connected_inbound: HashSet<String> = HashSet::new();
+    // app_uuids we currently hold a live Node connection to. Updated via
+    // NodeEvent::PeerConnected / PeerDisconnected. A peer can surface under
+    // different wire ids across scan rounds (or arrive inbound vs. outbound),
+    // so the scanner's wire_id alone is not enough to dedupe — we also check
+    // the post-handshake app_uuid before touching the dial path.
+    let mut connected_peers: HashSet<String> = HashSet::new();
+    // wire_id -> app_uuid learned at connect/accept time. Lets us short-circuit
+    // scanner hits that would otherwise walk all the way into connect_peer
+    // before the Node-layer dedup kicks in.
+    let mut wire_to_app: HashMap<String, String> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -298,6 +308,15 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
                         peer.id
                     );
                     continue;
+                }
+                if let Some(app) = wire_to_app.get(&peer.id) {
+                    if connected_peers.contains(app) {
+                        eprintln!(
+                            "[mlink:conn] serve: skip dial {} — app_uuid {} already connected",
+                            peer.id, app
+                        );
+                        continue;
+                    }
                 }
                 let attempt = attempts.entry(peer.id.clone()).or_insert(0);
                 if *attempt >= MAX_RETRIES {
@@ -335,6 +354,8 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
                     Ok(peer_id) => {
                         println!("[mlink] + {peer_id}");
                         attempts.remove(&peer_wire_id);
+                        wire_to_app.insert(peer_wire_id.clone(), peer_id.clone());
+                        connected_peers.insert(peer_id);
                     }
                     Err(MlinkError::RoomMismatch { peer_id }) => {
                         println!("[mlink] dropped {peer_id}: different room");
@@ -394,6 +415,8 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
                     Ok(peer_id) => {
                         println!("[mlink] + {peer_id} (incoming)");
                         attempts.remove(&wire_id);
+                        wire_to_app.insert(wire_id.clone(), peer_id.clone());
+                        connected_peers.insert(peer_id);
                     }
                     Err(MlinkError::RoomMismatch { peer_id }) => {
                         println!("[mlink] dropped incoming {peer_id}: different room");
@@ -411,9 +434,12 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
                 match ev {
                     Ok(NodeEvent::PeerConnected { peer_id }) => {
                         println!("[mlink] peer connected: {peer_id}");
+                        connected_peers.insert(peer_id);
                     }
                     Ok(NodeEvent::PeerDisconnected { peer_id }) => {
                         println!("[mlink] peer disconnected: {peer_id}");
+                        connected_peers.remove(&peer_id);
+                        wire_to_app.retain(|_, app| app != &peer_id);
                     }
                     Ok(NodeEvent::PeerLost { peer_id }) => {
                         println!("[mlink] peer lost: {peer_id}");
@@ -596,6 +622,9 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
     const MAX_RETRIES: u8 = 3;
     let mut attempts: HashMap<String, u8> = HashMap::new();
     let mut connected_inbound: HashSet<String> = HashSet::new();
+    // See cmd_serve for the rationale — dedup by app_uuid, mapped from wire_id.
+    let mut connected_peers: HashSet<String> = HashSet::new();
+    let mut wire_to_app: HashMap<String, String> = HashMap::new();
     // Reader-task handles per peer id. Kept so we can abort on disconnect
     // and avoid double-spawning if the same peer_id reconnects.
     let mut readers: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -635,6 +664,11 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                 if connected_inbound.contains(&peer.id) || engaged_wire_ids.contains(&peer.id) {
                     continue;
                 }
+                if let Some(app) = wire_to_app.get(&peer.id) {
+                    if connected_peers.contains(app) {
+                        continue;
+                    }
+                }
                 let attempt = attempts.entry(peer.id.clone()).or_insert(0);
                 if *attempt >= MAX_RETRIES {
                     continue;
@@ -665,6 +699,8 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                         println!("[mlink] + {peer_id}");
                         attempts.remove(&peer_wire_id);
                         peer_names.insert(peer_id.clone(), peer_wire_name);
+                        wire_to_app.insert(peer_wire_id.clone(), peer_id.clone());
+                        connected_peers.insert(peer_id.clone());
                         if !readers.contains_key(&peer_id) {
                             readers.insert(peer_id.clone(), node.spawn_peer_reader(peer_id));
                         }
@@ -713,6 +749,8 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                         println!("[mlink] + {peer_id} (incoming)");
                         attempts.remove(&wire_id);
                         peer_names.insert(peer_id.clone(), wire_id.clone());
+                        wire_to_app.insert(wire_id.clone(), peer_id.clone());
+                        connected_peers.insert(peer_id.clone());
                         if !readers.contains_key(&peer_id) {
                             readers.insert(peer_id.clone(), node.spawn_peer_reader(peer_id));
                         }
@@ -741,9 +779,12 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                     }
                     Ok(NodeEvent::PeerConnected { peer_id }) => {
                         println!("[mlink] peer connected: {peer_id}");
+                        connected_peers.insert(peer_id);
                     }
                     Ok(NodeEvent::PeerDisconnected { peer_id }) => {
                         println!("[mlink] peer disconnected: {peer_id}");
+                        connected_peers.remove(&peer_id);
+                        wire_to_app.retain(|_, app| app != &peer_id);
                         if let Some(h) = readers.remove(&peer_id) {
                             h.abort();
                         }
