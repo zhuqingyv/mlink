@@ -126,7 +126,10 @@ async fn cmd_serve(room_code: Option<String>) -> Result<(), MlinkError> {
                     // ctrl-C will clean up via `close` in BleTransport.
                     std::future::pending::<()>().await;
                 }
-                Err(e) => eprintln!("[mlink] peripheral advertisement error: {e}"),
+                Err(e) => {
+                    eprintln!("[mlink] peripheral advertisement error: {e}");
+                    print_bluetooth_permission_hint();
+                }
             }
         });
     }
@@ -384,9 +387,31 @@ async fn cmd_listen() -> Result<(), MlinkError> {
 
 async fn cmd_scan() -> Result<(), MlinkError> {
     let mut transport = BleTransport::new();
-    let peers = transport.discover().await?;
+    let peers = match transport.discover().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[mlink] scan failed: {e}");
+            print_bluetooth_permission_hint();
+            return Err(e);
+        }
+    };
+    if peers.is_empty() {
+        print_bluetooth_permission_hint();
+    }
     print_peer_list(&peers);
     Ok(())
+}
+
+/// Print a Bluetooth permission remediation hint. macOS silently returns an
+/// empty scan list when Core Bluetooth access is denied, so we print this on
+/// both explicit error *and* an empty discover result — the user can't tell
+/// the difference otherwise.
+fn print_bluetooth_permission_hint() {
+    eprintln!("[mlink] If this persists, Bluetooth access may be denied.");
+    eprintln!(
+        "[mlink] Fix: System Settings → Privacy & Security → Bluetooth → add your terminal app"
+    );
+    eprintln!("[mlink] Or install as app: bash scripts/install.sh");
 }
 
 fn print_peer_list(peers: &[DiscoveredPeer]) {
@@ -491,9 +516,13 @@ async fn cmd_doctor() -> Result<(), MlinkError> {
     match transport.discover().await {
         Ok(peers) => {
             println!("OK ({} device(s) visible during {}s scan)", peers.len(), 3);
+            if peers.is_empty() {
+                print_bluetooth_permission_hint();
+            }
         }
         Err(e) => {
             println!("FAIL ({e})");
+            print_bluetooth_permission_hint();
             return Err(e);
         }
     }
