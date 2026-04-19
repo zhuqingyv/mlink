@@ -390,6 +390,156 @@ mod tests {
         assert_eq!(sanitize_instance("foo bar_baz!"), "foo-bar-baz-");
     }
 
+    // T-U-02: with_port / port() 在 listen 之前
+    #[test]
+    fn with_port_updates_port_without_binding() {
+        let t = TcpTransport::new().with_port(54321);
+        assert_eq!(t.port(), 54321);
+        assert!(t.listener.is_none());
+    }
+
+    // T-U-03: with_discover_duration 生效（短窗口）
+    #[tokio::test]
+    async fn with_discover_duration_bounds_browse_window() {
+        let mut t = TcpTransport::new().with_discover_duration(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        // 结果不做断言，只验证调用耗时远小于默认 3s
+        let _ = t.discover().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "discover should honour short window, took {:?}",
+            elapsed
+        );
+    }
+
+    // T-U-06: hex_encode / hex_decode_8 正向往返（补充完整字节表）
+    #[test]
+    fn hex_encode_lowercase_16_chars() {
+        let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let s = hex_encode(&bytes);
+        assert_eq!(s.len(), 16);
+        assert_eq!(s, "0123456789abcdef");
+        assert!(s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        let back = hex_decode_8(&s).expect("decode");
+        assert_eq!(back, bytes);
+    }
+
+    // T-U-07: hex_decode_8 长度错误拒绝
+    #[test]
+    fn hex_decode_rejects_all_bad_lengths() {
+        assert!(hex_decode_8("").is_none());
+        assert!(hex_decode_8("abcd").is_none());
+        assert!(hex_decode_8(&"a".repeat(15)).is_none());
+        assert!(hex_decode_8(&"a".repeat(17)).is_none());
+    }
+
+    // T-U-08: hex_decode_8 非 hex 字符拒绝（16 字符但含非 hex）
+    #[test]
+    fn hex_decode_rejects_non_hex_variants() {
+        assert!(hex_decode_8("zzzzzzzzzzzzzzzz").is_none());
+        assert!(hex_decode_8("0123abcdefGHIJKL").is_none());
+        // 大写 hex 的 chars().all(is_ascii_hexdigit) 会通过，
+        // 但 "GHIJKL" 不是合法 hex，确保整体 16 字符里存在非 hex 就拒绝。
+        assert!(hex_decode_8("0123456789abcd!!").is_none());
+    }
+
+    // T-U-09: sanitize_instance 多分支
+    #[test]
+    fn sanitize_instance_variants() {
+        // ASCII 字母数字 + '-' 原样保留
+        assert_eq!(sanitize_instance("abc-123"), "abc-123");
+        // 空格 / 下划线 / 标点替换为 '-'
+        assert_eq!(sanitize_instance("foo bar_baz!"), "foo-bar-baz-");
+        // 非 ASCII 全部被替换，但至少保留占位
+        let s = sanitize_instance("中文");
+        assert!(!s.is_empty());
+        assert!(s.chars().all(|c| c == '-'));
+        // 空输入回退到 "mlink"
+        assert_eq!(sanitize_instance(""), "mlink");
+        // 混合中文与 '-'：5 个中文字符都被替换为 '-'，原有 '-' 保留 → 全 '-'
+        let mixed = sanitize_instance("只有-破折号");
+        assert_eq!(mixed.len(), "只有-破折号".chars().count());
+        assert!(mixed.chars().all(|c| c == '-'));
+    }
+
+    // T-U-10: local_hostname 三级回退顺序
+    // 这组用例会改全局环境变量，必须串行执行。
+    use std::sync::Mutex;
+    static HOST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_hostname_env<F: FnOnce()>(
+        hostname: Option<&str>,
+        host: Option<&str>,
+        computer: Option<&str>,
+        f: F,
+    ) {
+        let _g = HOST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = (
+            std::env::var("HOSTNAME").ok(),
+            std::env::var("HOST").ok(),
+            std::env::var("COMPUTERNAME").ok(),
+        );
+        // 先清再设
+        std::env::remove_var("HOSTNAME");
+        std::env::remove_var("HOST");
+        std::env::remove_var("COMPUTERNAME");
+        if let Some(v) = hostname { std::env::set_var("HOSTNAME", v); }
+        if let Some(v) = host { std::env::set_var("HOST", v); }
+        if let Some(v) = computer { std::env::set_var("COMPUTERNAME", v); }
+
+        f();
+
+        std::env::remove_var("HOSTNAME");
+        std::env::remove_var("HOST");
+        std::env::remove_var("COMPUTERNAME");
+        if let Some(v) = saved.0 { std::env::set_var("HOSTNAME", v); }
+        if let Some(v) = saved.1 { std::env::set_var("HOST", v); }
+        if let Some(v) = saved.2 { std::env::set_var("COMPUTERNAME", v); }
+    }
+
+    #[test]
+    fn local_hostname_prefers_hostname_env() {
+        with_hostname_env(Some("h1"), Some("h2"), Some("h3"), || {
+            assert_eq!(local_hostname(), "h1");
+        });
+    }
+
+    #[test]
+    fn local_hostname_falls_back_to_host_env() {
+        with_hostname_env(None, Some("h2"), Some("h3"), || {
+            assert_eq!(local_hostname(), "h2");
+        });
+    }
+
+    #[test]
+    fn local_hostname_falls_back_to_computername_env() {
+        with_hostname_env(None, None, Some("h3"), || {
+            assert_eq!(local_hostname(), "h3");
+        });
+    }
+
+    #[test]
+    fn local_hostname_default_when_all_unset() {
+        with_hostname_env(None, None, None, || {
+            assert_eq!(local_hostname(), "mlink-host");
+        });
+    }
+
+    // T-U-11: TcpConnection::new / peer_id 字段
+    #[tokio::test]
+    async fn tcp_connection_new_sets_peer_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let conn = TcpConnection::new(stream, "abc:123".to_string());
+        assert_eq!(conn.peer_id(), "abc:123");
+        accept_task.await.unwrap();
+    }
+
     /// Loopback roundtrip using 127.0.0.1 directly (no mDNS in the hot path).
     #[tokio::test]
     async fn loopback_connect_roundtrip() {

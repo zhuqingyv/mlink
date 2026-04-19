@@ -1,5 +1,5 @@
 use clap::Parser;
-use mlink_cli::{Cli, Commands, RoomAction, TrustAction};
+use mlink_cli::{validate_room_code, Cli, Commands, RoomAction, TransportKind, TrustAction};
 
 fn cmd(cli: &Cli) -> &Commands {
     cli.command.as_ref().expect("expected a subcommand")
@@ -250,6 +250,78 @@ fn test_oneline_no_args_none_none() {
     let cli = Cli::try_parse_from(["mlink"]).expect("bare mlink should parse");
     assert!(cli.code.is_none(), "code must be None, got {:?}", cli.code);
     assert!(cli.command.is_none(), "command must be None, got {:?}", cli.command);
+}
+
+// ---- T-S-04: 非法 room code 拒绝 -------------------------------------------
+
+#[test]
+fn test_validate_room_code_rejects_short() {
+    let err = validate_room_code("abc").unwrap_err();
+    assert!(err.contains("invalid room code"), "msg: {err}");
+    assert!(err.contains("expected 6 digits"), "msg: {err}");
+    assert!(err.contains("'abc'"), "original code should appear: {err}");
+}
+
+#[test]
+fn test_validate_room_code_rejects_5_digits() {
+    assert!(validate_room_code("12345").is_err());
+}
+
+#[test]
+fn test_validate_room_code_rejects_7_digits() {
+    assert!(validate_room_code("1234567").is_err());
+}
+
+#[test]
+fn test_validate_room_code_rejects_non_digits() {
+    assert!(validate_room_code("abcdef").is_err());
+    assert!(validate_room_code("12345a").is_err());
+}
+
+#[test]
+fn test_validate_room_code_rejects_empty() {
+    let err = validate_room_code("").unwrap_err();
+    assert!(err.contains("expected 6 digits"));
+}
+
+#[test]
+fn test_validate_room_code_accepts_6_digits() {
+    assert!(validate_room_code("482193").is_ok());
+    assert!(validate_room_code("000000").is_ok());
+    assert!(validate_room_code("999999").is_ok());
+}
+
+// ---- T-S-05: 非法 --transport 值 -------------------------------------------
+
+#[test]
+fn test_transport_kind_parses_ble_and_tcp() {
+    assert_eq!(TransportKind::parse("ble").unwrap(), TransportKind::Ble);
+    assert_eq!(TransportKind::parse("tcp").unwrap(), TransportKind::Tcp);
+}
+
+#[test]
+fn test_transport_kind_rejects_foo() {
+    let err = TransportKind::parse("foo").unwrap_err();
+    assert!(
+        err.contains("unknown --transport"),
+        "message should flag unknown transport: {err}"
+    );
+    assert!(
+        err.contains("\"foo\""),
+        "original input should appear (debug-quoted): {err}"
+    );
+    assert!(
+        err.contains("expected \"ble\" or \"tcp\""),
+        "message should list valid choices: {err}"
+    );
+}
+
+#[test]
+fn test_transport_kind_rejects_empty_and_case_mismatch() {
+    assert!(TransportKind::parse("").is_err());
+    // 我们只接受小写；大写不应默默接受
+    assert!(TransportKind::parse("BLE").is_err());
+    assert!(TransportKind::parse("Tcp").is_err());
 }
 
 #[test]

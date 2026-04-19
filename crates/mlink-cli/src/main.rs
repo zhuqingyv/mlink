@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use mlink_cli::{Cli, Commands, RoomAction, TrustAction};
+use mlink_cli::{Cli, Commands, RoomAction, TransportKind, TrustAction};
 use mlink_core::api::stream::create_stream;
 use mlink_core::core::node::{Node, NodeConfig, NodeEvent};
 use mlink_core::core::room::{generate_room_code, room_hash, RoomManager};
@@ -34,26 +34,8 @@ async fn main() -> ExitCode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportKind {
-    Ble,
-    Tcp,
-}
-
-impl TransportKind {
-    fn parse(s: &str) -> Result<Self, MlinkError> {
-        match s {
-            "ble" => Ok(TransportKind::Ble),
-            "tcp" => Ok(TransportKind::Tcp),
-            other => Err(MlinkError::HandlerError(format!(
-                "unknown --transport {other:?}: expected \"ble\" or \"tcp\""
-            ))),
-        }
-    }
-}
-
 async fn run(cli: Cli) -> Result<(), MlinkError> {
-    let kind = TransportKind::parse(&cli.transport)?;
+    let kind = TransportKind::parse(&cli.transport).map_err(MlinkError::HandlerError)?;
     match cli.command {
         Some(Commands::Serve) => cmd_serve(None, kind).await,
         Some(Commands::Room { action }) => cmd_room(action, kind).await,
@@ -509,12 +491,7 @@ async fn cmd_room(action: RoomAction, kind: TransportKind) -> Result<(), MlinkEr
 }
 
 fn validate_room_code(code: &str) -> Result<(), MlinkError> {
-    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-        return Err(MlinkError::HandlerError(format!(
-            "invalid room code '{code}': expected 6 digits"
-        )));
-    }
-    Ok(())
+    mlink_cli::validate_room_code(code).map_err(MlinkError::HandlerError)
 }
 
 /// `send <code> [msg] [--file <path>]` — bring up a short-lived node, scan

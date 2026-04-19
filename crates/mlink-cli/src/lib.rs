@@ -2,6 +2,41 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// Link-layer selector for the `--transport` flag. Kept in the library crate
+/// so both the binary and integration tests can exercise the string→enum
+/// parse logic without shelling out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Ble,
+    Tcp,
+}
+
+impl TransportKind {
+    /// Parse the raw flag value. Returns an error string (not MlinkError, to
+    /// avoid pulling the core crate into the public signature) ready to be
+    /// printed via `eprintln!("error: {msg}")`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "ble" => Ok(TransportKind::Ble),
+            "tcp" => Ok(TransportKind::Tcp),
+            other => Err(format!(
+                "unknown --transport {other:?}: expected \"ble\" or \"tcp\""
+            )),
+        }
+    }
+}
+
+/// Validate a 6-digit room code. Shared between the binary entrypoint and
+/// the integration tests so we exercise the real rule, not a copy.
+pub fn validate_room_code(code: &str) -> Result<(), String> {
+    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "invalid room code '{code}': expected 6 digits"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "mlink",
