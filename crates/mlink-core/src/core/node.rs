@@ -589,16 +589,24 @@ impl Node {
 
     /// Start a background task that drains messages from `peer_id` and
     /// publishes each `MessageType::Message` frame as a
-    /// `NodeEvent::MessageReceived`. The task exits on the first read error
-    /// (e.g. peer disconnect) after emitting `NodeEvent::PeerDisconnected` —
-    /// it does *not* attempt to reconnect.
+    /// `NodeEvent::MessageReceived`. On the first read error (e.g. peer EOF)
+    /// the task evicts the dead connection from `ConnectionManager`, drops
+    /// the peer from `PeerManager`, flips `PeerState` to `Disconnected`, and
+    /// emits `NodeEvent::PeerDisconnected` before returning. It does *not*
+    /// attempt to reconnect — discovery owns that.
+    ///
+    /// The cleanup matters because a reader that only emits the event (and
+    /// leaves the stale `Arc<dyn Connection>` in place) causes the next
+    /// `send_raw` to fail with "Broken pipe", and blocks a re-dial to the
+    /// same `app_uuid` via the dedup guard in `connect_peer`.
     ///
     /// Must be called after a successful `connect_peer` / `accept_incoming`
     /// for that peer; otherwise the reader will immediately see `PeerGone`
-    /// and exit.
+    /// and exit (still running the cleanup so nothing leaks).
     pub fn spawn_peer_reader(&self, peer_id: String) -> tokio::task::JoinHandle<()> {
         let connections = Arc::clone(&self.connections);
         let peer_states = Arc::clone(&self.peer_states);
+        let peer_manager = Arc::clone(&self.peer_manager);
         let events_tx = self.events_tx.clone();
         let encrypt = self.config.encrypt;
         tokio::spawn(async move {
@@ -617,6 +625,24 @@ impl Node {
                         // last-heartbeat timestamp.
                     }
                     Err(_) => {
+                        // Mirror `disconnect_peer`: evict conn, drop peer,
+                        // mark state Disconnected, fire the event. Done
+                        // inline because this task only holds Arc handles,
+                        // not `&Node`.
+                        let removed = {
+                            let mut guard = connections.lock().await;
+                            guard.remove(&peer_id)
+                        };
+                        if let Some(conn) = removed {
+                            let _ = conn.close().await;
+                        }
+                        peer_manager.remove(&peer_id).await;
+                        {
+                            let mut states = peer_states.write().await;
+                            if let Some(s) = states.get_mut(&peer_id) {
+                                s.state = NodeState::Disconnected;
+                            }
+                        }
                         let _ = events_tx.send(NodeEvent::PeerDisconnected {
                             peer_id: peer_id.clone(),
                         });
@@ -1353,5 +1379,107 @@ mod tests {
 
         assert_eq!(writes.load(Ordering::SeqCst), 1);
         reader_handle.abort();
+    }
+
+    /// Regression test for the "dead connection lingers after peer EOF" bug
+    /// (Broken pipe on re-send; re-dial blocked by dedup). When the reader's
+    /// `recv_once` returns Err (the peer closed), the reader task must evict
+    /// the connection from `ConnectionManager`, drop the peer, flip the
+    /// PeerState to Disconnected, and emit PeerDisconnected — otherwise the
+    /// next `send_raw` will try to push into a dead socket and a fresh dial
+    /// to the same `app_uuid` will be rejected as a duplicate.
+    #[tokio::test]
+    async fn reader_eof_cleans_up_connection_and_peer_manager() {
+        use async_trait::async_trait;
+        use tokio::sync::Notify;
+
+        // A connection whose read() blocks until `release` fires, then
+        // returns an error to simulate the peer closing. write() and close()
+        // succeed so the cleanup path can run without synthetic errors.
+        struct EofOnDemand {
+            id: String,
+            release: Arc<Notify>,
+        }
+        #[async_trait]
+        impl Connection for EofOnDemand {
+            async fn read(&self) -> Result<Vec<u8>> {
+                self.release.notified().await;
+                Err(MlinkError::HandlerError("peer closed".into()))
+            }
+            async fn write(&self, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+            fn peer_id(&self) -> &str {
+                &self.id
+            }
+        }
+
+        let _tmp = set_tmp_home();
+        let trust_tmp = tempfile::tempdir().expect("tmp");
+        let node = Node::new(tmp_config(trust_tmp.path().join("t.json")))
+            .await
+            .expect("new");
+
+        let release = Arc::new(Notify::new());
+        let conn = EofOnDemand {
+            id: "bye-peer".into(),
+            release: Arc::clone(&release),
+        };
+        node.attach_connection("bye-peer".into(), Box::new(conn)).await;
+        // Also register the peer in PeerManager to confirm it gets dropped.
+        node.peer_manager
+            .add(Peer {
+                id: "bye-peer".into(),
+                name: "bye".into(),
+                app_uuid: "bye-peer".into(),
+                connected_at: Instant::now(),
+                transport_id: "mock".into(),
+            })
+            .await;
+        assert!(node.has_peer("bye-peer").await);
+        assert!(node.get_peer("bye-peer").await.is_some());
+
+        let mut events = node.subscribe();
+        let reader_handle = node.spawn_peer_reader("bye-peer".into());
+
+        // Trigger the simulated EOF and wait for the cleanup to finish.
+        release.notify_one();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if timeout.is_zero() {
+                panic!("timed out waiting for PeerDisconnected");
+            }
+            match tokio::time::timeout(timeout, events.recv()).await {
+                Ok(Ok(NodeEvent::PeerDisconnected { peer_id })) => {
+                    assert_eq!(peer_id, "bye-peer");
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => panic!("event stream closed"),
+                Err(_) => panic!("timeout waiting for PeerDisconnected"),
+            }
+        }
+
+        // The reader task itself must exit after emitting the event.
+        tokio::time::timeout(Duration::from_secs(1), reader_handle)
+            .await
+            .expect("reader must exit after EOF")
+            .expect("reader task joined");
+
+        // Cleanup invariants: no connection, no peer, state flipped.
+        assert!(!node.has_peer("bye-peer").await, "connection must be evicted");
+        assert!(
+            node.get_peer("bye-peer").await.is_none(),
+            "peer_manager must drop the peer"
+        );
+        assert_eq!(node.connection_count().await, 0);
+        assert_eq!(
+            node.peer_state("bye-peer").await,
+            Some(NodeState::Disconnected)
+        );
     }
 }

@@ -287,8 +287,26 @@ async fn connect_loop(
                         connected_peers.insert(peer_id);
                     }
                     Ok(NodeEvent::PeerDisconnected { peer_id }) => {
+                        // Drop bookkeeping for the now-dead peer and tell the
+                        // scanner to forget every wire_id that mapped to this
+                        // app_uuid. Without the unsee the scanner's `seen`
+                        // set keeps the stale wire_id → the peer never
+                        // re-surfaces when it comes back online, so we can
+                        // never re-dial. `engaged` / `connected_inbound` also
+                        // need clearing so a fresh advertisement from the
+                        // same wire_id isn't silently dropped.
                         connected_peers.remove(&peer_id);
+                        let dead_wires: Vec<String> = wire_to_app
+                            .iter()
+                            .filter_map(|(w, a)| (a == &peer_id).then(|| w.clone()))
+                            .collect();
                         wire_to_app.retain(|_, a| a != &peer_id);
+                        for wire in dead_wires {
+                            engaged.remove(&wire);
+                            connected_inbound.remove(&wire);
+                            attempts.remove(&wire);
+                            let _ = unsee_tx.try_send(wire);
+                        }
                     }
                     Ok(_) => {}
                     Err(_) => {}
