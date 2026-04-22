@@ -152,8 +152,8 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
                         }
                     };
                     loop {
-                        let central_id = match peripheral.wait_for_central().await {
-                            Ok(id) => id,
+                        let (central_id, rx) = match peripheral.wait_for_central().await {
+                            Ok(pair) => pair,
                             Err(e) => {
                                 eprintln!("[mlink] peripheral accept error: {e}");
                                 return;
@@ -163,6 +163,7 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
                             mlink_core::transport::peripheral::MacPeripheralConnection::new(
                                 central_id.clone(),
                                 peripheral.clone(),
+                                rx,
                             ),
                         );
                         if accepted_tx.send(conn).await.is_err() {
@@ -497,8 +498,8 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                         }
                     };
                     loop {
-                        let central_id = match peripheral.wait_for_central().await {
-                            Ok(id) => id,
+                        let (central_id, rx) = match peripheral.wait_for_central().await {
+                            Ok(pair) => pair,
                             Err(e) => {
                                 eprintln!("[mlink] peripheral accept error: {e}");
                                 return;
@@ -508,6 +509,7 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                             mlink_core::transport::peripheral::MacPeripheralConnection::new(
                                 central_id.clone(),
                                 peripheral.clone(),
+                                rx,
                             ),
                         );
                         if accepted_tx.send(conn).await.is_err() {

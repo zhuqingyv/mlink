@@ -9,6 +9,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -48,6 +49,13 @@ use super::ble::{CTRL_CHAR_UUID, MLINK_SERVICE_UUID, RX_CHAR_UUID, TX_CHAR_UUID}
 use super::transport_trait::Connection;
 
 /// Events surfaced by the Obj-C delegate into async land.
+///
+/// `StateChanged`, `ServiceAdded`, `AdvertisingStarted` and `CentralSubscribed`
+/// travel on the shared control channel (one receiver, drained by bring-up and
+/// by `wait_for_central`). `Received` is kept as a public variant for backward
+/// compatibility with external matchers, but inbound frames are routed on
+/// per-central channels so a read loop for one central never consumes another
+/// central's (or a handshake's) data.
 #[derive(Debug)]
 pub enum PeripheralEvent {
     /// CBPeripheralManager state changed (PoweredOn / Unauthorized / ...).
@@ -59,12 +67,24 @@ pub enum PeripheralEvent {
     /// Remote central subscribed to RX characteristic (treat as connect signal).
     CentralSubscribed { central_id: String },
     /// Central wrote bytes to the TX characteristic (inbound frame).
+    /// Not emitted on the shared control channel — kept as a public variant for
+    /// compatibility with existing consumers and tests; inbound bytes are
+    /// delivered on per-central channels returned from `wait_for_central`.
     Received(Vec<u8>),
 }
 
 /// Event queue shared with the delegate; internal to this module.
 type EventSender = mpsc::UnboundedSender<PeripheralEvent>;
 type EventReceiver = mpsc::UnboundedReceiver<PeripheralEvent>;
+
+/// Per-central inbound-bytes channel type.
+type BytesSender = mpsc::UnboundedSender<Vec<u8>>;
+type BytesReceiver = mpsc::UnboundedReceiver<Vec<u8>>;
+
+/// Map from central identifier to its inbound-bytes sender. Mutated from both
+/// Obj-C delegate callbacks (non-async) and from `wait_for_central` on the
+/// async side, so we use a std Mutex.
+type PerCentralTx = Arc<StdMutex<HashMap<String, BytesSender>>>;
 
 /// Centrals currently subscribed to the RX characteristic. Wrapped in a `std`
 /// Mutex (not tokio) because we mutate it from Obj-C delegate callbacks which
@@ -104,7 +124,14 @@ pub struct MacPeripheral {
     _ctrl_char: Retained<CBMutableCharacteristic>,
     _service: Retained<CBMutableService>,
     _delegate: Retained<MlinkPeripheralDelegate>,
-    events: Arc<Mutex<EventReceiver>>,
+    /// Control-plane events: StateChanged / ServiceAdded / AdvertisingStarted /
+    /// CentralSubscribed. Inbound write bytes do NOT flow through here — they
+    /// are routed on per-central channels (see `per_central_tx`) so a single
+    /// shared receiver can't swallow another central's frames.
+    ctrl_events: Arc<Mutex<EventReceiver>>,
+    /// Per-central inbound-bytes senders; populated on CentralSubscribed and
+    /// torn down on unsubscribe. Shared with the delegate.
+    per_central_tx: PerCentralTx,
     subscribed: Arc<SubscribedCentrals>,
     local_name: String,
     room_hash: Option<[u8; 8]>,
@@ -122,6 +149,7 @@ impl MacPeripheral {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<PeripheralEvent>();
         let subscribed: Arc<SubscribedCentrals> = Arc::new(SubscribedCentralsInner::new());
+        let per_central_tx: PerCentralTx = Arc::new(StdMutex::new(HashMap::new()));
 
         let advertised_name = match room_hash {
             Some(h) => format!("{local_name}#{}", hex_encode(&h)),
@@ -160,9 +188,11 @@ impl MacPeripheral {
             attach_characteristics(&service, &[&tx_char, &rx_char, &ctrl_char]);
 
             let delegate = MlinkPeripheralDelegate::new(DelegateIvars {
-                tx: tx.clone(),
+                ctrl_tx: tx.clone(),
+                per_central_tx: per_central_tx.clone(),
                 subscribed: subscribed.clone(),
                 rx_char_uuid: RX_CHAR_UUID,
+                tx_char_uuid: TX_CHAR_UUID,
             });
 
             let delegate_proto: &ProtocolObject<dyn CBPeripheralManagerDelegate> =
@@ -259,7 +289,8 @@ impl MacPeripheral {
             _ctrl_char: ctrl_char,
             _service: service,
             _delegate: delegate,
-            events: Arc::new(Mutex::new(rx)),
+            ctrl_events: Arc::new(Mutex::new(rx)),
+            per_central_tx,
             subscribed,
             local_name,
             room_hash,
@@ -274,16 +305,33 @@ impl MacPeripheral {
         self.room_hash.as_ref()
     }
 
-    /// Await the next delegate event. Returns `None` if the sender was dropped.
+    /// Await the next control-plane delegate event. Returns `None` if the
+    /// sender was dropped. Inbound write bytes no longer travel on this
+    /// channel — they are surfaced on per-central receivers returned from
+    /// `wait_for_central`.
     pub async fn next_event(&self) -> Option<PeripheralEvent> {
-        self.events.lock().await.recv().await
+        self.ctrl_events.lock().await.recv().await
     }
 
-    /// Wait for a central to subscribe to RX; returns a synthetic peer id.
-    pub async fn wait_for_central(&self) -> Result<String> {
+    /// Wait for a central to subscribe to RX. Returns the central id plus a
+    /// receiver that yields ONLY bytes written by that specific central to the
+    /// TX characteristic. Each call creates a fresh per-central channel; the
+    /// caller (typically a `MacPeripheralConnection`) owns the receiver and
+    /// reads from it without contending with other centrals' traffic.
+    pub async fn wait_for_central(&self) -> Result<(String, BytesReceiver)> {
         loop {
             match self.next_event().await {
-                Some(PeripheralEvent::CentralSubscribed { central_id }) => return Ok(central_id),
+                Some(PeripheralEvent::CentralSubscribed { central_id }) => {
+                    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    // Replace (not merge) any prior entry under the same id —
+                    // a reconnecting central should get its own fresh channel,
+                    // and dropping the old sender will close the previous
+                    // receiver's stream so the stale reader sees EOF.
+                    if let Ok(mut map) = self.per_central_tx.lock() {
+                        map.insert(central_id.clone(), tx);
+                    }
+                    return Ok((central_id, rx));
+                }
                 Some(_) => continue,
                 None => {
                     return Err(MlinkError::HandlerError(
@@ -343,12 +391,24 @@ unsafe impl Sync for MacPeripheral {}
 
 // ---------- delegate ----------
 
-/// Ivars held by the declared Obj-C delegate class. Keeps the channel sender
-/// and the shared subscribed-centrals list accessible from delegate callbacks.
+/// Ivars held by the declared Obj-C delegate class. Keeps the control-plane
+/// sender, the per-central inbound-bytes map, and the shared subscribed-centrals
+/// list accessible from delegate callbacks.
 struct DelegateIvars {
-    tx: EventSender,
+    /// Control-plane events (state + service + advertising + subscribe).
+    ctrl_tx: EventSender,
+    /// Per-central inbound-bytes senders, keyed by CBCentral identifier.
+    /// Shared with `MacPeripheral`; lookups happen on the CoreBluetooth
+    /// delegate queue in `didReceiveWriteRequests:`.
+    per_central_tx: PerCentralTx,
     subscribed: Arc<SubscribedCentrals>,
+    /// UUID of the notify characteristic centrals subscribe to (RX on the
+    /// peripheral side, where the peripheral notifies centrals).
     rx_char_uuid: Uuid,
+    /// UUID of the write characteristic centrals write into (TX on the
+    /// peripheral side, where the peripheral receives frames). Used to filter
+    /// `didReceiveWriteRequests:` so CTRL writes don't masquerade as payload.
+    tx_char_uuid: Uuid,
 }
 
 declare_class!(
@@ -377,7 +437,7 @@ declare_class!(
         fn peripheral_manager_did_update_state(&self, peripheral: &CBPeripheralManager) {
             let state = unsafe { peripheral.state() };
             eprintln!("[mlink:periph] delegate: didUpdateState -> {:?}", state);
-            let _ = self.ivars().tx.send(PeripheralEvent::StateChanged(state));
+            let _ = self.ivars().ctrl_tx.send(PeripheralEvent::StateChanged(state));
         }
 
         #[method(peripheralManagerDidStartAdvertising:error:)]
@@ -397,7 +457,7 @@ declare_class!(
                     Err(msg)
                 }
             };
-            let _ = self.ivars().tx.send(PeripheralEvent::AdvertisingStarted(res));
+            let _ = self.ivars().ctrl_tx.send(PeripheralEvent::AdvertisingStarted(res));
         }
 
         #[method(peripheralManager:didAddService:error:)]
@@ -428,7 +488,7 @@ declare_class!(
                     Err(msg)
                 }
             };
-            let _ = self.ivars().tx.send(PeripheralEvent::ServiceAdded(res));
+            let _ = self.ivars().ctrl_tx.send(PeripheralEvent::ServiceAdded(res));
         }
 
         #[method(peripheralManager:central:didSubscribeToCharacteristic:)]
@@ -456,7 +516,7 @@ declare_class!(
             }
             let _ = self
                 .ivars()
-                .tx
+                .ctrl_tx
                 .send(PeripheralEvent::CentralSubscribed { central_id: id });
         }
 
@@ -465,14 +525,27 @@ declare_class!(
             &self,
             _peripheral: &CBPeripheralManager,
             central: &CBCentral,
-            _characteristic: &CBCharacteristic,
+            characteristic: &CBCharacteristic,
         ) {
+            // Only tear down per-central state when the central drops the RX
+            // subscription; unsubscribing from other characteristics (e.g.
+            // CTRL notify) should leave the read channel open.
+            let char_uuid = unsafe { characteristic.UUID().UUIDString().to_string() };
+            if !uuid_matches(&char_uuid, &self.ivars().rx_char_uuid) {
+                return;
+            }
+
             let target_id = unsafe { central.identifier().UUIDString().to_string() };
             if let Ok(mut guard) = self.ivars().subscribed.lock() {
                 guard.retain(|c| {
                     let id = unsafe { c.identifier().UUIDString().to_string() };
                     id != target_id
                 });
+            }
+            // Drop the per-central inbound-bytes sender so the owning
+            // `MacPeripheralConnection::read` observes EOF instead of hanging.
+            if let Ok(mut map) = self.ivars().per_central_tx.lock() {
+                map.remove(&target_id);
             }
         }
 
@@ -482,16 +555,49 @@ declare_class!(
             peripheral: &CBPeripheralManager,
             requests: &NSArray<CBATTRequest>,
         ) {
-            // Collect bytes from every request; CoreBluetooth batches writes.
+            // Route each write to the originating central's inbound channel.
             // Per Apple docs we must respond to the FIRST request in the array
-            // to acknowledge them all.
+            // to acknowledge them all — regardless of filtering decisions for
+            // the individual entries.
             let count = requests.len();
             for i in 0..count {
                 let req = requests.get(i).expect("request index in range");
-                if let Some(data) = unsafe { req.value() } {
-                    let bytes = data.bytes().to_vec();
-                    if !bytes.is_empty() {
-                        let _ = self.ivars().tx.send(PeripheralEvent::Received(bytes));
+                let char_uuid = unsafe { req.characteristic().UUID().UUIDString().to_string() };
+                let Some(data) = (unsafe { req.value() }) else { continue };
+                let bytes = data.bytes().to_vec();
+                // Delegate the filter/route decision to `classify_write` so
+                // the logic tested in unit tests is the same logic running
+                // here. Writes to CTRL / RX / anything non-TX fall through
+                // as Ignore and never reach the protocol reader — the old
+                // code treated every write as Received, which let CTRL
+                // traffic corrupt the handshake stream.
+                if classify_write(&char_uuid, &self.ivars().tx_char_uuid, bytes.len())
+                    != WriteRouteDecision::Deliver
+                {
+                    continue;
+                }
+                let central_id = unsafe {
+                    req.central().identifier().UUIDString().to_string()
+                };
+                let sender = self
+                    .ivars()
+                    .per_central_tx
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&central_id).cloned());
+                match sender {
+                    Some(tx) => {
+                        let _ = tx.send(bytes);
+                    }
+                    None => {
+                        // Central wrote before we observed a subscribe, or
+                        // after it unsubscribed. Nothing we can do with the
+                        // bytes — drop them and log so operators can see it
+                        // happen rather than silently losing data.
+                        eprintln!(
+                            "[mlink:periph] drop write from unknown central {}",
+                            central_id
+                        );
                     }
                 }
             }
@@ -530,6 +636,32 @@ fn uuid_matches(uuid_str: &str, expected: &Uuid) -> bool {
     // sufficient.
     let needle = expected.to_string();
     uuid_str.eq_ignore_ascii_case(&needle)
+}
+
+/// Outcome of evaluating a single `didReceiveWriteRequests:` entry.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteRouteDecision {
+    /// Deliver these bytes to the per-central channel for `central_id`.
+    Deliver,
+    /// Silently ignore (wrong characteristic, empty payload, etc.). The write
+    /// still needs to be responded to at the batch level.
+    Ignore,
+}
+
+/// Pure helper mirroring the delegate's per-write decision. Extracted so the
+/// filter/route logic can be tested without a live CBPeripheralManager.
+fn classify_write(
+    request_char_uuid: &str,
+    tx_char_uuid: &Uuid,
+    payload_len: usize,
+) -> WriteRouteDecision {
+    if !uuid_matches(request_char_uuid, tx_char_uuid) {
+        return WriteRouteDecision::Ignore;
+    }
+    if payload_len == 0 {
+        return WriteRouteDecision::Ignore;
+    }
+    WriteRouteDecision::Deliver
 }
 
 // ---------- bring-up sequencing ----------
@@ -763,19 +895,28 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// `Connection` returned from `listen()` on macOS. Reads pull from the delegate's
-/// event channel and return bytes from `didReceiveWriteRequests:`. Writes push
-/// bytes to subscribed centrals via `updateValue:forCharacteristic:onSubscribedCentrals:`.
+/// `Connection` returned from `listen()` on macOS. Reads pull from this
+/// connection's private per-central receiver (created by `wait_for_central`),
+/// so a single peripheral serving multiple centrals hands each one an
+/// independent read stream and no two connections can steal each other's
+/// frames. Writes push bytes to subscribed centrals via
+/// `updateValue:forCharacteristic:onSubscribedCentrals:`.
 pub struct MacPeripheralConnection {
     peer_id: String,
     peripheral: Arc<MacPeripheral>,
+    rx: Mutex<BytesReceiver>,
 }
 
 impl MacPeripheralConnection {
-    pub fn new(peer_id: impl Into<String>, peripheral: Arc<MacPeripheral>) -> Self {
+    pub fn new(
+        peer_id: impl Into<String>,
+        peripheral: Arc<MacPeripheral>,
+        rx: BytesReceiver,
+    ) -> Self {
         Self {
             peer_id: peer_id.into(),
             peripheral,
+            rx: Mutex::new(rx),
         }
     }
 
@@ -787,16 +928,11 @@ impl MacPeripheralConnection {
 #[async_trait::async_trait]
 impl Connection for MacPeripheralConnection {
     async fn read(&mut self) -> Result<Vec<u8>> {
-        loop {
-            match self.peripheral.next_event().await {
-                Some(PeripheralEvent::Received(bytes)) => return Ok(bytes),
-                Some(_) => continue,
-                None => {
-                    return Err(MlinkError::PeerGone {
-                        peer_id: self.peer_id.clone(),
-                    });
-                }
-            }
+        match self.rx.lock().await.recv().await {
+            Some(bytes) => Ok(bytes),
+            None => Err(MlinkError::PeerGone {
+                peer_id: self.peer_id.clone(),
+            }),
         }
     }
 
@@ -861,5 +997,122 @@ mod tests {
         // Forces the declare_class! registration path to run; panics in debug
         // builds if any method signature disagrees with the protocol.
         let _cls = MlinkPeripheralDelegate::class();
+    }
+
+    #[test]
+    fn classify_write_accepts_tx_with_payload() {
+        let tx_str = TX_CHAR_UUID.to_string();
+        assert_eq!(
+            classify_write(&tx_str, &TX_CHAR_UUID, 42),
+            WriteRouteDecision::Deliver
+        );
+        // Uppercase UUID string still matches.
+        assert_eq!(
+            classify_write(&tx_str.to_uppercase(), &TX_CHAR_UUID, 1),
+            WriteRouteDecision::Deliver
+        );
+    }
+
+    #[test]
+    fn classify_write_ignores_ctrl_char_writes() {
+        // A write to the CTRL characteristic must NOT be forwarded as a
+        // payload frame — this was the R5 bug where the delegate treated
+        // every write as an inbound protocol byte regardless of the target.
+        let ctrl_str = CTRL_CHAR_UUID.to_string();
+        assert_eq!(
+            classify_write(&ctrl_str, &TX_CHAR_UUID, 8),
+            WriteRouteDecision::Ignore
+        );
+        // RX (notify-only on the peripheral side) should never receive
+        // writes, but even if CoreBluetooth forwards one we ignore it.
+        let rx_str = RX_CHAR_UUID.to_string();
+        assert_eq!(
+            classify_write(&rx_str, &TX_CHAR_UUID, 8),
+            WriteRouteDecision::Ignore
+        );
+        // An unknown UUID is ignored too — fail closed, not open.
+        assert_eq!(
+            classify_write("00000000-0000-0000-0000-000000000000", &TX_CHAR_UUID, 8),
+            WriteRouteDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn classify_write_ignores_empty_payload_even_on_tx() {
+        // Zero-length TX writes are legal at the BLE layer but carry no
+        // protocol information; the old delegate also skipped them and we
+        // preserve that behavior so readers don't see spurious empty frames.
+        let tx_str = TX_CHAR_UUID.to_string();
+        assert_eq!(
+            classify_write(&tx_str, &TX_CHAR_UUID, 0),
+            WriteRouteDecision::Ignore
+        );
+    }
+
+    #[tokio::test]
+    async fn per_central_routing_isolates_receivers() {
+        // Simulate the map the delegate uses: sending to central A must only
+        // surface on A's receiver, never on B's. This is the core R2 guarantee
+        // (the pre-fix code shared one global receiver across centrals, so
+        // handshake frames for one peer were swallowed by another's read loop).
+        let map: PerCentralTx = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel::<Vec<u8>>();
+        map.lock().unwrap().insert("central-a".into(), tx_a);
+        map.lock().unwrap().insert("central-b".into(), tx_b);
+
+        // Send two frames to A and one to B.
+        {
+            let guard = map.lock().unwrap();
+            guard.get("central-a").unwrap().send(b"hello-a1".to_vec()).unwrap();
+            guard.get("central-a").unwrap().send(b"hello-a2".to_vec()).unwrap();
+            guard.get("central-b").unwrap().send(b"hello-b1".to_vec()).unwrap();
+        }
+
+        assert_eq!(rx_a.recv().await.unwrap(), b"hello-a1");
+        assert_eq!(rx_a.recv().await.unwrap(), b"hello-a2");
+        assert_eq!(rx_b.recv().await.unwrap(), b"hello-b1");
+
+        // Nothing further should arrive on either side after the writers
+        // above have been exhausted — but both senders are still live in the
+        // map, so the channels stay open. `try_recv` confirms emptiness
+        // without blocking.
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn per_central_unsubscribe_closes_receiver() {
+        // Dropping the sender (what didUnsubscribeFromCharacteristic does by
+        // removing the map entry) must close the receiver so the connection's
+        // read loop observes EOF and surfaces PeerGone, rather than hanging.
+        let map: PerCentralTx = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        map.lock().unwrap().insert("central-a".into(), tx);
+
+        // Simulate unsubscribe: remove (and therefore drop) the sender.
+        map.lock().unwrap().remove("central-a");
+
+        assert!(rx.recv().await.is_none(), "receiver should observe EOF");
+    }
+
+    #[tokio::test]
+    async fn wait_for_central_creates_fresh_channel_on_reconnect() {
+        // Calling wait_for_central twice under the same id must replace the
+        // previous sender so a reconnecting central doesn't share a channel
+        // with a stale connection. We exercise the same map-insert semantics
+        // wait_for_central uses, then verify the old receiver observes EOF.
+        let map: PerCentralTx = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx_old, mut rx_old) = mpsc::unbounded_channel::<Vec<u8>>();
+        map.lock().unwrap().insert("central-a".into(), tx_old);
+
+        // Reconnect: fresh pair, insert under the same key (drops the old tx).
+        let (tx_new, mut rx_new) = mpsc::unbounded_channel::<Vec<u8>>();
+        map.lock().unwrap().insert("central-a".into(), tx_new);
+
+        assert!(rx_old.recv().await.is_none(), "old receiver should EOF");
+
+        map.lock().unwrap().get("central-a").unwrap().send(b"post-reconnect".to_vec()).unwrap();
+        assert_eq!(rx_new.recv().await.unwrap(), b"post-reconnect");
     }
 }

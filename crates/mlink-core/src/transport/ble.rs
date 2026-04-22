@@ -264,8 +264,8 @@ impl Transport for BleTransport {
 
             let peripheral = MacPeripheral::start(self.local_name.clone(), self.room_hash).await?;
             let peripheral = std::sync::Arc::new(peripheral);
-            let central_id = peripheral.wait_for_central().await?;
-            let conn = MacPeripheralConnection::new(central_id, peripheral);
+            let (central_id, rx) = peripheral.wait_for_central().await?;
+            let conn = MacPeripheralConnection::new(central_id, peripheral, rx);
             Ok(Box::new(conn))
         }
 
