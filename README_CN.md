@@ -104,6 +104,56 @@ ws.send(JSON.stringify({ v: 1, type: "send", payload: { room: "567892", payload:
 ws.send(JSON.stringify({ v: 1, type: "send", payload: { room: "567892", to: "<peer-uuid>", payload: { text: "hi you" } } }))
 ```
 
+## Node.js / TypeScript SDK
+
+```bash
+# 本地安装（从源码）
+cd packages/client && npm run setup
+
+# 然后在任意项目中
+npm link mlink
+```
+
+```typescript
+import { MlinkClient } from 'mlink'
+
+const client = new MlinkClient()          // 自动探测 daemon 端口
+// 或: new MlinkClient({ port: 8080 })    // 显式指定端口
+
+await client.connect()
+console.log('daemon port:', client.port)
+
+await client.join('567892')
+client.on('message', (msg) => {
+  console.log(msg.from, msg.payload)
+})
+await client.send('567892', { text: 'hello' })
+
+// 事件
+client.on('room_state', (state) => console.log(state.peers))
+client.on('error', (err) => console.error(err.code, err.message))
+client.on('disconnected', () => console.log('lost connection'))
+
+// 清理
+await client.leave('567892')
+client.disconnect()
+```
+
+### API
+
+| 方法 | 说明 |
+|------|------|
+| `new MlinkClient({ port? })` | 创建客户端。省略 port 则从 daemon.json 自动探测 |
+| `connect()` | 连接 daemon WebSocket |
+| `disconnect()` | 关闭连接 |
+| `join(room)` | 订阅房间 |
+| `leave(room)` | 退订房间 |
+| `send(room, payload, to?)` | 发送消息（广播或点对点） |
+| `client.port` | daemon 端口 |
+| `client.appUuid` | daemon 的 app UUID |
+| `client.rooms` | 已订阅的房间列表 |
+| `client.peers(room)` | 房间内的 peer 列表 |
+
 ## 传输通道支持
 
 | Transport   | 适用场景               | 状态   |

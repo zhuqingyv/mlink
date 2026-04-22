@@ -104,6 +104,56 @@ ws.send(JSON.stringify({ v: 1, type: "send", payload: { room: "567892", payload:
 ws.send(JSON.stringify({ v: 1, type: "send", payload: { room: "567892", to: "<peer-uuid>", payload: { text: "hi you" } } }))
 ```
 
+## Node.js / TypeScript SDK
+
+```bash
+# Local install (from source)
+cd packages/client && npm run setup
+
+# Then in any project
+npm link mlink
+```
+
+```typescript
+import { MlinkClient } from 'mlink'
+
+const client = new MlinkClient()          // auto-detect daemon port
+// or: new MlinkClient({ port: 8080 })    // explicit port
+
+await client.connect()
+console.log('daemon port:', client.port)
+
+await client.join('567892')
+client.on('message', (msg) => {
+  console.log(msg.from, msg.payload)
+})
+await client.send('567892', { text: 'hello' })
+
+// Events
+client.on('room_state', (state) => console.log(state.peers))
+client.on('error', (err) => console.error(err.code, err.message))
+client.on('disconnected', () => console.log('lost connection'))
+
+// Cleanup
+await client.leave('567892')
+client.disconnect()
+```
+
+### API
+
+| Method | Description |
+|--------|-------------|
+| `new MlinkClient({ port? })` | Create client. Omit port to auto-detect from daemon.json |
+| `connect()` | Connect to daemon WebSocket |
+| `disconnect()` | Close connection |
+| `join(room)` | Subscribe to room |
+| `leave(room)` | Unsubscribe from room |
+| `send(room, payload, to?)` | Send message (broadcast or unicast) |
+| `client.port` | Daemon port |
+| `client.appUuid` | Daemon's app UUID |
+| `client.rooms` | Subscribed rooms |
+| `client.peers(room)` | Peers in room |
+
 ## Transport Support
 
 | Transport   | Use case                   | Status   |
