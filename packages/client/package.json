@@ -1,5 +1,5 @@
 {
-  "name": "mlink-client",
+  "name": "mlink",
   "version": "0.1.0",
   "description": "WebSocket client SDK for mlink daemon",
   "main": "dist/index.js",
