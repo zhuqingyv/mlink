@@ -8,8 +8,28 @@ use btleplug::api::{
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::{Stream, StreamExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
+
+/// Process-wide shared BLE adapter. All BleTransport instances must share the
+/// same CBCentralManager so peripherals discovered during scan remain reachable
+/// when a separate instance (or caller) issues connect(). Without this, the
+/// scan-side adapter's peripheral list is invisible to the connect-side
+/// adapter and find_peripheral returns PeerGone.
+static SHARED_ADAPTER: OnceCell<Adapter> = OnceCell::const_new();
+
+async fn shared_adapter() -> Result<&'static Adapter> {
+    SHARED_ADAPTER
+        .get_or_try_init(|| async {
+            let manager = Manager::new().await?;
+            let adapters = manager.adapters().await?;
+            adapters
+                .into_iter()
+                .next()
+                .ok_or_else(|| MlinkError::HandlerError("no BLE adapter available".into()))
+        })
+        .await
+}
 
 type NotificationStream = Pin<Box<dyn Stream<Item = ValueNotification> + Send>>;
 
@@ -90,7 +110,6 @@ pub fn should_dial_as_central(local_app_uuid: &str, peer_identity: &[u8; 8]) -> 
 }
 
 pub struct BleTransport {
-    adapter: Option<Adapter>,
     negotiated_mtu: usize,
     scan_duration: Duration,
     local_name: String,
@@ -105,7 +124,6 @@ pub struct BleTransport {
 impl BleTransport {
     pub fn new() -> Self {
         Self {
-            adapter: None,
             negotiated_mtu: DEFAULT_MTU,
             scan_duration: DEFAULT_SCAN_DURATION,
             local_name: "mlink".into(),
@@ -171,16 +189,8 @@ impl BleTransport {
         Ok(std::sync::Arc::new(peripheral))
     }
 
-    async fn ensure_adapter(&mut self) -> Result<&Adapter> {
-        if self.adapter.is_none() {
-            let manager = Manager::new().await?;
-            let adapters = manager.adapters().await?;
-            let adapter = adapters.into_iter().next().ok_or_else(|| {
-                MlinkError::HandlerError("no BLE adapter available".into())
-            })?;
-            self.adapter = Some(adapter);
-        }
-        Ok(self.adapter.as_ref().unwrap())
+    async fn ensure_adapter(&mut self) -> Result<&'static Adapter> {
+        shared_adapter().await
     }
 }
 
