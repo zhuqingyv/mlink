@@ -10,11 +10,16 @@
 //!    connect and logs any inbound message. Actual command handling is
 //!    intentionally out of scope for this skeleton.
 
+pub mod discovery;
+pub mod protocol;
+pub mod session;
+
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -37,6 +42,13 @@ pub const DAEMON_VERSION: &str = "0.1.0";
 /// beyond this the `recv()` yields `Lagged` and we simply skip ahead.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Shared handle to one session's joined-room set. Kept in
+/// `DaemonState::sessions` so the `leave` handler on *other* sessions can
+/// check whether a room is still in use before retiring its hash from the
+/// Node — a naive "always remove" would pull the filter out from under any
+/// other client that still holds the room.
+pub type JoinedRooms = Arc<StdMutex<HashSet<String>>>;
+
 /// State shared across WS connections. `Node` is behind `Arc` so we can clone
 /// the handle into each connection task; `node_events` is the broadcast
 /// sender fed by a background bridge task that reads from `Node::subscribe()`.
@@ -44,6 +56,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub struct DaemonState {
     pub node: Arc<Node>,
     pub node_events: broadcast::Sender<NodeEvent>,
+    pub sessions: Arc<StdMutex<Vec<JoinedRooms>>>,
 }
 
 /// Contents of `~/.mlink/daemon.json`. Written on startup, removed on clean
@@ -158,45 +171,7 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<DaemonState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
-}
-
-/// Per-connection task. Sends the `ready` frame then logs any inbound frame.
-/// Future agents will replace the log with real command dispatch.
-async fn handle_socket(mut socket: WebSocket, state: DaemonState) {
-    let ready = serde_json::json!({
-        "v": WS_PROTOCOL_VERSION,
-        "type": "ready",
-        "payload": {
-            "app_uuid": state.node.app_uuid(),
-            "version": DAEMON_VERSION,
-        }
-    });
-    match serde_json::to_string(&ready) {
-        Ok(s) => {
-            if let Err(e) = socket.send(Message::Text(s)).await {
-                tracing::warn!(error = %e, "failed to send ready frame");
-                return;
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "failed to serialize ready frame");
-            return;
-        }
-    }
-
-    while let Some(msg) = socket.recv().await {
-        match msg {
-            Ok(Message::Text(t)) => tracing::info!(len = t.len(), "ws text inbound: {t}"),
-            Ok(Message::Binary(b)) => tracing::info!(len = b.len(), "ws binary inbound"),
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => break,
-            Err(e) => {
-                tracing::warn!(error = %e, "ws recv error");
-                break;
-            }
-        }
-    }
+    ws.on_upgrade(move |socket| session::run(socket, state))
 }
 
 /// Start a `Node`, wire a background bridge from `Node::subscribe()` into the
@@ -234,7 +209,16 @@ pub async fn build_state() -> Result<DaemonState, DaemonError> {
         }
     });
 
-    Ok(DaemonState { node, node_events: tx })
+    // Kick off discovery + accept in the background so every WS client shares
+    // one scanner/peripheral pair. `DaemonTransport::from_env` is permissive —
+    // an unknown value silently falls back to TCP (safe default for CI).
+    discovery::spawn(Arc::clone(&node), discovery::DaemonTransport::from_env());
+
+    Ok(DaemonState {
+        node,
+        node_events: tx,
+        sessions: Arc::new(StdMutex::new(Vec::new())),
+    })
 }
 
 fn host_name() -> String {

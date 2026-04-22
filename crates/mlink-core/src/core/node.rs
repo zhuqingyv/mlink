@@ -275,28 +275,36 @@ impl Node {
         // room_hash must be in our set. Empty set = accept anyone. This lets a
         // single Node belong to several rooms at once — we just need *some*
         // overlap between our membership and the peer's claim.
-        {
+        //
+        // Snapshot and immediately drop the StdMutex guard so no `!Send`
+        // MutexGuard outlives a later `.await` — needed for `tokio::spawn`ing
+        // the daemon's connect/accept loop.
+        let (rooms_empty, room_match) = {
             let rooms = self.room_hashes.lock().expect("room_hashes poisoned");
-            if !rooms.is_empty() {
-                match peer_hs.room_hash {
-                    Some(peer) if rooms.contains(&peer) => {
-                        eprintln!(
-                            "[mlink:conn] node.connect_peer room match OK peer={} room={:?}",
-                            discovered.id, peer
-                        );
-                    }
-                    other => {
-                        eprintln!(
-                            "[mlink:conn] node.connect_peer ROOM MISMATCH peer={} local_rooms={:?} peer_claims={:?}",
-                            discovered.id, *rooms, other
-                        );
-                        drop(rooms);
-                        let _ = conn.close().await;
-                        return Err(MlinkError::RoomMismatch {
-                            peer_id: discovered.id.clone(),
-                        });
-                    }
-                }
+            let empty = rooms.is_empty();
+            let matched = match peer_hs.room_hash {
+                Some(peer) => rooms.contains(&peer),
+                None => false,
+            };
+            let snapshot = rooms.clone();
+            (empty, (matched, snapshot))
+        };
+        if !rooms_empty {
+            let (matched, snapshot) = room_match;
+            if matched {
+                eprintln!(
+                    "[mlink:conn] node.connect_peer room match OK peer={} room={:?}",
+                    discovered.id, peer_hs.room_hash
+                );
+            } else {
+                eprintln!(
+                    "[mlink:conn] node.connect_peer ROOM MISMATCH peer={} local_rooms={:?} peer_claims={:?}",
+                    discovered.id, snapshot, peer_hs.room_hash
+                );
+                let _ = conn.close().await;
+                return Err(MlinkError::RoomMismatch {
+                    peer_id: discovered.id.clone(),
+                });
             }
         }
 
@@ -395,29 +403,36 @@ impl Node {
             }
         };
 
-        {
+        // Snapshot room state before any `.await` so the StdMutex guard does
+        // not straddle a suspension point — see the matching comment in
+        // `connect_peer` above for why this matters for `tokio::spawn`.
+        let (rooms_empty, accept_match) = {
             let rooms = self.room_hashes.lock().expect("room_hashes poisoned");
-            if !rooms.is_empty() {
-                match peer_hs.room_hash {
-                    Some(peer) if rooms.contains(&peer) => {
-                        eprintln!(
-                            "[mlink:conn] node.accept_incoming room match OK wire={wire_id} room={:?}",
-                            peer
-                        );
-                    }
-                    other => {
-                        eprintln!(
-                            "[mlink:conn] node.accept_incoming ROOM MISMATCH wire={wire_id} local_rooms={:?} peer_claims={:?}",
-                            *rooms, other
-                        );
-                        drop(rooms);
-                        let wire_peer_id = conn.peer_id().to_string();
-                        let _ = conn.close().await;
-                        return Err(MlinkError::RoomMismatch {
-                            peer_id: wire_peer_id,
-                        });
-                    }
-                }
+            let empty = rooms.is_empty();
+            let matched = match peer_hs.room_hash {
+                Some(peer) => rooms.contains(&peer),
+                None => false,
+            };
+            let snapshot = rooms.clone();
+            (empty, (matched, snapshot))
+        };
+        if !rooms_empty {
+            let (matched, snapshot) = accept_match;
+            if matched {
+                eprintln!(
+                    "[mlink:conn] node.accept_incoming room match OK wire={wire_id} room={:?}",
+                    peer_hs.room_hash
+                );
+            } else {
+                eprintln!(
+                    "[mlink:conn] node.accept_incoming ROOM MISMATCH wire={wire_id} local_rooms={:?} peer_claims={:?}",
+                    snapshot, peer_hs.room_hash
+                );
+                let wire_peer_id = conn.peer_id().to_string();
+                let _ = conn.close().await;
+                return Err(MlinkError::RoomMismatch {
+                    peer_id: wire_peer_id,
+                });
             }
         }
 
