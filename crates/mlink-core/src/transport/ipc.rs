@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 use crate::protocol::errors::{MlinkError, Result};
 
@@ -100,14 +102,19 @@ impl Transport for IpcTransport {
 }
 
 pub struct IpcConnection {
-    stream: Option<UnixStream>,
+    // See TcpConnection: split the stream so reader and writer tasks make
+    // progress independently rather than queuing through one lock.
+    read_half: Mutex<Option<OwnedReadHalf>>,
+    write_half: Mutex<Option<OwnedWriteHalf>>,
     peer_id: String,
 }
 
 impl IpcConnection {
     pub fn new(stream: UnixStream, peer_id: impl Into<String>) -> Self {
+        let (r, w) = stream.into_split();
         Self {
-            stream: Some(stream),
+            read_half: Mutex::new(Some(r)),
+            write_half: Mutex::new(Some(w)),
             peer_id: peer_id.into(),
         }
     }
@@ -115,8 +122,9 @@ impl IpcConnection {
 
 #[async_trait]
 impl Connection for IpcConnection {
-    async fn read(&mut self) -> Result<Vec<u8>> {
-        let stream = self.stream.as_mut().ok_or_else(|| MlinkError::PeerGone {
+    async fn read(&self) -> Result<Vec<u8>> {
+        let mut guard = self.read_half.lock().await;
+        let stream = guard.as_mut().ok_or_else(|| MlinkError::PeerGone {
             peer_id: self.peer_id.clone(),
         })?;
         let mut len_buf = [0u8; 4];
@@ -129,8 +137,9 @@ impl Connection for IpcConnection {
         Ok(payload)
     }
 
-    async fn write(&mut self, data: &[u8]) -> Result<()> {
-        let stream = self.stream.as_mut().ok_or_else(|| MlinkError::PeerGone {
+    async fn write(&self, data: &[u8]) -> Result<()> {
+        let mut guard = self.write_half.lock().await;
+        let stream = guard.as_mut().ok_or_else(|| MlinkError::PeerGone {
             peer_id: self.peer_id.clone(),
         })?;
         let len = u32::try_from(data.len()).map_err(|_| MlinkError::PayloadTooLarge {
@@ -145,9 +154,11 @@ impl Connection for IpcConnection {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
-        if let Some(mut stream) = self.stream.take() {
-            match stream.shutdown().await {
+    async fn close(&self) -> Result<()> {
+        self.read_half.lock().await.take();
+        let taken = self.write_half.lock().await.take();
+        if let Some(mut w) = taken {
+            match w.shutdown().await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {}
                 Err(e) => return Err(e.into()),
@@ -214,7 +225,7 @@ mod tests {
         let server_path = path_str.clone();
         let server = tokio::spawn(async move {
             let mut t = IpcTransport::new(server_path);
-            let mut conn = t.listen().await.unwrap();
+            let conn = t.listen().await.unwrap();
             let got = conn.read().await.unwrap();
             conn.write(&got).await.unwrap();
             conn.close().await.unwrap();
@@ -229,7 +240,7 @@ mod tests {
             rssi: None,
             metadata: Vec::new(),
         };
-        let mut client = client_t.connect(&peer).await.unwrap();
+        let client = client_t.connect(&peer).await.unwrap();
         client.write(b"ping").await.unwrap();
         let echo = client.read().await.unwrap();
         assert_eq!(echo, b"ping");
@@ -246,7 +257,7 @@ mod tests {
         let server_path = path_str.clone();
         let server = tokio::spawn(async move {
             let mut t = IpcTransport::new(server_path);
-            let mut conn = t.listen().await.unwrap();
+            let conn = t.listen().await.unwrap();
             let _ = conn.read().await;
         });
 
@@ -259,7 +270,7 @@ mod tests {
             rssi: None,
             metadata: Vec::new(),
         };
-        let mut client = client_t.connect(&peer).await.unwrap();
+        let client = client_t.connect(&peer).await.unwrap();
         client.close().await.unwrap();
         let err = client.write(b"x").await.unwrap_err();
         assert!(matches!(err, MlinkError::PeerGone { .. }));
@@ -275,7 +286,7 @@ mod tests {
         let server_path = path_str.clone();
         let server = tokio::spawn(async move {
             let mut t = IpcTransport::new(server_path);
-            let mut conn = t.listen().await.unwrap();
+            let conn = t.listen().await.unwrap();
             let got = conn.read().await.unwrap();
             assert!(got.is_empty());
             conn.write(&[]).await.unwrap();
@@ -291,7 +302,7 @@ mod tests {
             rssi: None,
             metadata: Vec::new(),
         };
-        let mut client = client_t.connect(&peer).await.unwrap();
+        let client = client_t.connect(&peer).await.unwrap();
         client.write(&[]).await.unwrap();
         let echo = client.read().await.unwrap();
         assert!(echo.is_empty());

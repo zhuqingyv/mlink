@@ -217,11 +217,11 @@ async fn test_perform_handshake_rejects_wrong_message_type() {
     };
     let bogus_bytes = encode_frame(&bogus);
 
-    let (mut ours, mut theirs) = mock_pair();
+    let (ours, theirs) = mock_pair();
     // Peer writes bogus frame; we then try to handshake.
     theirs.write(&bogus_bytes).await.expect("theirs write");
 
-    let err = perform_handshake(&mut ours, &sample_handshake("me"))
+    let err = perform_handshake(&ours, &sample_handshake("me"))
         .await
         .expect_err("should reject non-handshake reply");
     assert!(matches!(err, MlinkError::CodecError(_)));
@@ -244,24 +244,24 @@ async fn test_connection_manager_crud() {
     let (conn_a, _sink_a) = mock_pair();
     let (conn_b, _sink_b) = mock_pair();
 
-    mgr.add("peer-a".into(), Box::new(conn_a)).await;
-    mgr.add("peer-b".into(), Box::new(conn_b)).await;
+    mgr.add("peer-a".into(), std::sync::Arc::new(conn_a));
+    mgr.add("peer-b".into(), std::sync::Arc::new(conn_b));
     assert_eq!(mgr.count(), 2);
 
     let mut ids = mgr.list_ids();
     ids.sort();
     assert_eq!(ids, vec!["peer-a".to_string(), "peer-b".to_string()]);
 
-    let got = mgr.get("peer-a").await.expect("peer-a present");
+    let got = mgr.shared("peer-a").expect("peer-a present");
     assert_eq!(got.peer_id(), "mock-peer-a");
-    assert!(mgr.get("peer-missing").await.is_none());
+    assert!(mgr.shared("peer-missing").is_none());
 
-    let removed = mgr.remove("peer-a").await;
+    let removed = mgr.remove("peer-a");
     assert!(removed.is_some());
     assert_eq!(mgr.count(), 1);
-    assert!(mgr.get("peer-a").await.is_none());
+    assert!(mgr.shared("peer-a").is_none());
 
-    assert!(mgr.remove("peer-a").await.is_none(), "double remove returns None");
+    assert!(mgr.remove("peer-a").is_none(), "double remove returns None");
 }
 
 // ============================================================================

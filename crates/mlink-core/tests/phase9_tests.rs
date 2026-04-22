@@ -8,7 +8,6 @@
 //   * RoomManager integration mirrors how Node would track joined rooms.
 //   * Peripheral module is smoke-checked for compile-time presence.
 
-use tokio::sync::Mutex;
 use std::sync::Arc;
 
 use mlink_core::core::connection::perform_handshake;
@@ -44,7 +43,7 @@ fn make_frame(msg_type: MessageType, seq: u16, payload: Vec<u8>) -> Vec<u8> {
 }
 
 async fn send_msg(
-    conn: &mut dyn Connection,
+    conn: &dyn Connection,
     msg_type: MessageType,
     seq: u16,
     payload: &[u8],
@@ -52,7 +51,7 @@ async fn send_msg(
     conn.write(&make_frame(msg_type, seq, payload.to_vec())).await
 }
 
-async fn recv_msg(conn: &mut dyn Connection) -> Result<(Frame, Vec<u8>)> {
+async fn recv_msg(conn: &dyn Connection) -> Result<(Frame, Vec<u8>)> {
     let bytes = conn.read().await?;
     let frame = decode_frame(&bytes)?;
     let payload = frame.payload.clone();
@@ -67,12 +66,12 @@ async fn recv_msg(conn: &mut dyn Connection) -> Result<(Frame, Vec<u8>)> {
 async fn test_e2e_message_roundtrip() {
     // Two endpoints wired via mock_pair. A sends a Message frame, B decodes it,
     // verifies magic/version/type/payload match.
-    let (mut a, mut b) = mock_pair();
+    let (a, b) = mock_pair();
 
     let payload = b"hello from A".to_vec();
-    send_msg(&mut a, MessageType::Message, 1, &payload).await.expect("send");
+    send_msg(&a, MessageType::Message, 1, &payload).await.expect("send");
 
-    let (frame, got) = recv_msg(&mut b).await.expect("recv");
+    let (frame, got) = recv_msg(&b).await.expect("recv");
     assert_eq!(frame.magic, MAGIC);
     assert_eq!(frame.version, PROTOCOL_VERSION);
     assert_eq!(frame.seq, 1);
@@ -84,14 +83,14 @@ async fn test_e2e_message_roundtrip() {
 #[tokio::test]
 async fn test_e2e_bidirectional() {
     // A→B then B→A, independent sequence numbers.
-    let (mut a, mut b) = mock_pair();
+    let (a, b) = mock_pair();
 
-    send_msg(&mut a, MessageType::Message, 1, b"A->B").await.expect("a->b");
-    let (_, got) = recv_msg(&mut b).await.expect("b recv");
+    send_msg(&a, MessageType::Message, 1, b"A->B").await.expect("a->b");
+    let (_, got) = recv_msg(&b).await.expect("b recv");
     assert_eq!(got, b"A->B");
 
-    send_msg(&mut b, MessageType::Message, 7, b"B->A").await.expect("b->a");
-    let (frame, got) = recv_msg(&mut a).await.expect("a recv");
+    send_msg(&b, MessageType::Message, 7, b"B->A").await.expect("b->a");
+    let (frame, got) = recv_msg(&a).await.expect("a recv");
     assert_eq!(got, b"B->A");
     assert_eq!(frame.seq, 7);
 }
@@ -99,12 +98,12 @@ async fn test_e2e_bidirectional() {
 #[tokio::test]
 async fn test_e2e_large_payload_roundtrip() {
     // Multi-KB payload still survives end-to-end through the mock pipe.
-    let (mut a, mut b) = mock_pair();
+    let (a, b) = mock_pair();
 
     let payload: Vec<u8> = (0u16..4096).map(|i| (i & 0xff) as u8).collect();
-    send_msg(&mut a, MessageType::Message, 0, &payload).await.expect("send");
+    send_msg(&a, MessageType::Message, 0, &payload).await.expect("send");
 
-    let (frame, got) = recv_msg(&mut b).await.expect("recv");
+    let (frame, got) = recv_msg(&b).await.expect("recv");
     assert_eq!(frame.length as usize, payload.len());
     assert_eq!(got, payload);
 }
@@ -147,9 +146,9 @@ async fn test_room_isolation() {
     // endpoint arrives at the other endpoint byte-identical — the isolation
     // lives at the *scanner filter* layer, not in the bytes. Verify that: the
     // frame itself carries no room_hash, so payload pass-through is total.
-    let (mut a, mut b) = mock_pair();
-    send_msg(&mut a, MessageType::Message, 0, b"cross-room").await.expect("send");
-    let (_, got) = recv_msg(&mut b).await.expect("recv");
+    let (a, b) = mock_pair();
+    send_msg(&a, MessageType::Message, 0, b"cross-room").await.expect("send");
+    let (_, got) = recv_msg(&b).await.expect("recv");
     assert_eq!(got, b"cross-room");
 }
 
@@ -185,8 +184,6 @@ async fn test_e2e_handshake() {
     // Two endpoints each drive perform_handshake concurrently; each must see
     // the peer's announced UUID come back through the real wire format.
     let (a, b) = mock_pair();
-    let mut a: Box<dyn Connection> = Box::new(a);
-    let mut b: Box<dyn Connection> = Box::new(b);
 
     let hs_a = sample_handshake("uuid-alpha", 512);
     let hs_b = sample_handshake("uuid-bravo", 256);
@@ -195,11 +192,11 @@ async fn test_e2e_handshake() {
     let hs_b_clone = hs_b.clone();
 
     let task_a = tokio::spawn(async move {
-        let got = perform_handshake(a.as_mut(), &hs_a_clone).await.expect("a hs");
+        let got = perform_handshake(&a, &hs_a_clone).await.expect("a hs");
         (got, a)
     });
     let task_b = tokio::spawn(async move {
-        let got = perform_handshake(b.as_mut(), &hs_b_clone).await.expect("b hs");
+        let got = perform_handshake(&b, &hs_b_clone).await.expect("b hs");
         (got, b)
     });
 
@@ -217,8 +214,6 @@ async fn test_e2e_handshake_rejects_wrong_message_type() {
     // fail with CodecError. Drive A's perform_handshake while B hand-rolls a
     // non-handshake reply.
     let (a, b) = mock_pair();
-    let mut a: Box<dyn Connection> = Box::new(a);
-    let mut b: Box<dyn Connection> = Box::new(b);
 
     let hs_a = sample_handshake("uuid-a", 512);
 
@@ -234,7 +229,7 @@ async fn test_e2e_handshake_rejects_wrong_message_type() {
         let _ = b.read().await;
     });
 
-    let err = perform_handshake(a.as_mut(), &hs_a).await.unwrap_err();
+    let err = perform_handshake(&a, &hs_a).await.unwrap_err();
     assert!(matches!(err, MlinkError::CodecError(_)));
 
     let _ = drain.await;
@@ -251,8 +246,8 @@ async fn test_e2e_rpc() {
     // back a Response frame. B decodes, matches request_id, and the pending
     // waiter resolves with the handler's output.
     let (a, b) = mock_pair();
-    let a = Arc::new(Mutex::new(Box::new(a) as Box<dyn Connection>));
-    let b = Arc::new(Mutex::new(Box::new(b) as Box<dyn Connection>));
+    let a: Arc<dyn Connection> = Arc::new(a);
+    let b: Arc<dyn Connection> = Arc::new(b);
 
     // A-side: registry with echo handler.
     let reg = Arc::new(RpcRegistry::new());
@@ -277,21 +272,15 @@ async fn test_e2e_rpc() {
         })
         .unwrap()
     };
-    {
-        let mut guard = b.lock().await;
-        send_msg(&mut **guard, MessageType::Request, 1, &req_bytes)
-            .await
-            .expect("b send request");
-    }
+    send_msg(&*b, MessageType::Request, 1, &req_bytes)
+        .await
+        .expect("b send request");
 
     // A-side task: receive request, dispatch, send response.
     let a_clone = Arc::clone(&a);
     let reg_clone = Arc::clone(&reg);
     let a_task = tokio::spawn(async move {
-        let (frame, payload) = {
-            let mut guard = a_clone.lock().await;
-            recv_msg(&mut **guard).await.expect("a recv")
-        };
+        let (frame, payload) = recv_msg(&*a_clone).await.expect("a recv");
         let (_, _, mt) = decode_flags(frame.flags);
         assert_eq!(mt, MessageType::Request);
 
@@ -308,22 +297,13 @@ async fn test_e2e_rpc() {
             data: out,
         };
         let resp_bytes = rmp_serde::to_vec(&resp).expect("encode resp");
-        let mut guard = a_clone.lock().await;
-        send_msg(
-            &mut **guard,
-            MessageType::Response,
-            2,
-            &resp_bytes,
-        )
-        .await
-        .expect("a send resp");
+        send_msg(&*a_clone, MessageType::Response, 2, &resp_bytes)
+            .await
+            .expect("a send resp");
     });
 
     // B-side: read response frame, decode, deliver to pending.
-    let (frame, payload) = {
-        let mut guard = b.lock().await;
-        recv_msg(&mut **guard).await.expect("b recv resp")
-    };
+    let (frame, payload) = recv_msg(&*b).await.expect("b recv resp");
     let (_, _, mt) = decode_flags(frame.flags);
     assert_eq!(mt, MessageType::Response);
 
@@ -345,8 +325,6 @@ async fn test_e2e_rpc_unknown_method_errors() {
     use mlink_core::api::rpc::{RpcRequest, RPC_STATUS_ERROR};
 
     let (a, b) = mock_pair();
-    let mut a: Box<dyn Connection> = Box::new(a);
-    let mut b: Box<dyn Connection> = Box::new(b);
 
     let reg = RpcRegistry::new(); // no handlers registered
 
@@ -357,10 +335,10 @@ async fn test_e2e_rpc_unknown_method_errors() {
         data: vec![],
     };
     let req_bytes = rmp_serde::to_vec(&req).unwrap();
-    send_msg(b.as_mut(), MessageType::Request, 0, &req_bytes).await.expect("b send");
+    send_msg(&b, MessageType::Request, 0, &req_bytes).await.expect("b send");
 
     // A receives, handle_request returns UnknownMethod; encode error response.
-    let (_, payload) = recv_msg(a.as_mut()).await.expect("a recv");
+    let (_, payload) = recv_msg(&a).await.expect("a recv");
     let req_back = decode_request(&payload).unwrap();
     let err = reg
         .handle_request(&req_back.method, req_back.data)
@@ -374,10 +352,10 @@ async fn test_e2e_rpc_unknown_method_errors() {
         data: b"missing".to_vec(),
     };
     let resp_bytes = rmp_serde::to_vec(&resp).unwrap();
-    send_msg(a.as_mut(), MessageType::Response, 0, &resp_bytes).await.expect("a send");
+    send_msg(&a, MessageType::Response, 0, &resp_bytes).await.expect("a send");
 
     // B reads, checks status.
-    let (_, resp_payload) = recv_msg(b.as_mut()).await.expect("b recv");
+    let (_, resp_payload) = recv_msg(&b).await.expect("b recv");
     let resp_back = decode_response(&resp_payload).unwrap();
     assert_eq!(resp_back.status, RPC_STATUS_ERROR);
     assert_eq!(resp_back.request_id, 42);
@@ -448,8 +426,6 @@ fn test_peripheral_module_exists() {
 #[tokio::test]
 async fn test_e2e_handshake_then_messages() {
     let (a, b) = mock_pair();
-    let mut a: Box<dyn Connection> = Box::new(a);
-    let mut b: Box<dyn Connection> = Box::new(b);
 
     let hs_a = sample_handshake("uuid-alpha", 512);
     let hs_b = sample_handshake("uuid-bravo", 512);
@@ -457,13 +433,13 @@ async fn test_e2e_handshake_then_messages() {
     // Run handshakes concurrently using join!
     let hs_a_c = hs_a.clone();
     let hs_b_c = hs_b.clone();
-    let ((got_a, mut a), (got_b, mut b)) = tokio::join!(
+    let ((got_a, a), (got_b, b)) = tokio::join!(
         async move {
-            let got = perform_handshake(a.as_mut(), &hs_a_c).await.expect("a hs");
+            let got = perform_handshake(&a, &hs_a_c).await.expect("a hs");
             (got, a)
         },
         async move {
-            let got = perform_handshake(b.as_mut(), &hs_b_c).await.expect("b hs");
+            let got = perform_handshake(&b, &hs_b_c).await.expect("b hs");
             (got, b)
         },
     );
@@ -471,8 +447,8 @@ async fn test_e2e_handshake_then_messages() {
     assert_eq!(got_b, hs_a);
 
     // Now swap to plain messages over the same channel.
-    send_msg(a.as_mut(), MessageType::Message, 1, b"post-handshake").await.expect("a send");
-    let (_, got) = recv_msg(b.as_mut()).await.expect("b recv");
+    send_msg(&a, MessageType::Message, 1, b"post-handshake").await.expect("a send");
+    let (_, got) = recv_msg(&b).await.expect("b recv");
     assert_eq!(got, b"post-handshake");
 }
 
@@ -550,7 +526,7 @@ async fn test_node_attach_and_send_raw() {
     // Attach one mock endpoint to a Node, drive the other endpoint directly,
     // observe that send_raw produces a wire-format frame the peer can decode.
     let (node, _tmp) = make_node(false).await;
-    let (local, mut remote) = mock_pair();
+    let (local, remote) = mock_pair();
     node.attach_connection("peer-x".into(), Box::new(local)).await;
 
     assert_eq!(node.connection_count().await, 1);
@@ -572,7 +548,7 @@ async fn test_node_attach_and_send_raw() {
 async fn test_node_recv_raw_over_mock() {
     // Inverse direction: remote writes a valid frame, Node::recv_raw yields it.
     let (node, _tmp) = make_node(false).await;
-    let (local, mut remote) = mock_pair();
+    let (local, remote) = mock_pair();
     node.attach_connection("peer-y".into(), Box::new(local)).await;
 
     remote

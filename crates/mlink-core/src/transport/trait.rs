@@ -20,11 +20,19 @@ pub struct DiscoveredPeer {
 }
 
 /// A live byte-oriented connection to a peer on a specific `Transport`.
+///
+/// `read` and `write` take `&self` so a reader task and a writer task can make
+/// progress in parallel on the same connection. Implementations are expected
+/// to protect their mutable transport state internally (e.g. a `Mutex` around
+/// a TcpStream write half, per-rx channel for BLE peripheral). Serialising
+/// access through an outer `Mutex<Box<dyn Connection>>` at the Node layer
+/// would reintroduce the head-of-line block that parked `send_raw` whenever
+/// a peer reader was waiting for bytes.
 #[async_trait]
 pub trait Connection: Send + Sync {
-    async fn read(&mut self) -> Result<Vec<u8>>;
-    async fn write(&mut self, data: &[u8]) -> Result<()>;
-    async fn close(&mut self) -> Result<()>;
+    async fn read(&self) -> Result<Vec<u8>>;
+    async fn write(&self, data: &[u8]) -> Result<()>;
+    async fn close(&self) -> Result<()>;
     fn peer_id(&self) -> &str;
 }
 

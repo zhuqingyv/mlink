@@ -182,10 +182,7 @@ impl Node {
     }
 
     pub async fn stop(&self) -> Result<()> {
-        let ids: Vec<String> = {
-            let guard = self.connections.lock().await;
-            guard.list_ids()
-        };
+        let ids: Vec<String> = self.connections.lock().await.list_ids();
         for id in ids {
             let _ = self.disconnect_peer(&id).await;
         }
@@ -210,8 +207,7 @@ impl Node {
     /// the CLI/serve loop (and internally here) to keep a second dial from
     /// racing a connection that has already completed its handshake.
     pub async fn has_peer(&self, app_uuid: &str) -> bool {
-        let guard = self.connections.lock().await;
-        guard.get(app_uuid).await.is_some()
+        self.connections.lock().await.contains(app_uuid)
     }
 
     pub async fn connect_peer(
@@ -231,7 +227,7 @@ impl Node {
             _role, self.app_uuid, discovered.id
         );
 
-        let mut conn = transport.connect(discovered).await.map_err(|e| {
+        let conn = transport.connect(discovered).await.map_err(|e| {
             eprintln!("[mlink:conn] node.connect_peer transport.connect FAILED peer={}: {e}", discovered.id);
             e
         })?;
@@ -257,7 +253,7 @@ impl Node {
             "[mlink:conn] node.connect_peer -> perform_handshake peer={} wire_room_hash={:?}",
             discovered.id, wire_room
         );
-        let peer_hs = match perform_handshake(conn.as_mut(), &local_hs).await {
+        let peer_hs = match perform_handshake(&*conn, &local_hs).await {
             Ok(hs) => {
                 eprintln!(
                     "[mlink:conn] node.connect_peer handshake OK peer_wire={} peer_app={} peer_room={:?}",
@@ -313,7 +309,7 @@ impl Node {
         // the working one out of ConnectionManager and tear down the live link.
         {
             let guard = self.connections.lock().await;
-            if guard.get(&peer_id).await.is_some() {
+            if guard.contains(&peer_id) {
                 drop(guard);
                 eprintln!(
                     "[mlink:conn] node.connect_peer DEDUP peer={} already connected — closing new dial",
@@ -335,7 +331,7 @@ impl Node {
         self.peer_manager.add(peer).await;
         {
             let mut guard = self.connections.lock().await;
-            guard.add(peer_id.clone(), conn).await;
+            guard.add(peer_id.clone(), Arc::from(conn));
         }
         {
             let mut states = self.peer_states.write().await;
@@ -358,7 +354,7 @@ impl Node {
     /// failure the connection is closed so callers don't need to clean up.
     pub async fn accept_incoming(
         &self,
-        mut conn: Box<dyn Connection>,
+        conn: Box<dyn Connection>,
         transport_id: &str,
         fallback_name: String,
     ) -> Result<String> {
@@ -382,7 +378,7 @@ impl Node {
             "[mlink:conn] node.accept_incoming -> perform_handshake wire={wire_id} wire_room_hash={:?}",
             wire_room
         );
-        let peer_hs = match perform_handshake(conn.as_mut(), &local_hs).await {
+        let peer_hs = match perform_handshake(&*conn, &local_hs).await {
             Ok(hs) => {
                 eprintln!(
                     "[mlink:conn] node.accept_incoming handshake OK wire={wire_id} peer_app={} peer_room={:?}",
@@ -432,7 +428,7 @@ impl Node {
         // connection. Returning Ok lets the caller treat it as a no-op.
         {
             let guard = self.connections.lock().await;
-            if guard.get(&peer_id).await.is_some() {
+            if guard.contains(&peer_id) {
                 drop(guard);
                 eprintln!(
                     "[mlink:conn] node.accept_incoming DEDUP peer={} already connected — closing duplicate",
@@ -454,7 +450,7 @@ impl Node {
         self.peer_manager.add(peer).await;
         {
             let mut guard = self.connections.lock().await;
-            guard.add(peer_id.clone(), conn).await;
+            guard.add(peer_id.clone(), Arc::from(conn));
         }
         {
             let mut states = self.peer_states.write().await;
@@ -478,7 +474,7 @@ impl Node {
     pub async fn attach_connection(&self, peer_id: String, conn: Box<dyn Connection>) {
         {
             let mut guard = self.connections.lock().await;
-            guard.add(peer_id.clone(), conn).await;
+            guard.add(peer_id.clone(), Arc::from(conn));
         }
         {
             let mut states = self.peer_states.write().await;
@@ -493,9 +489,9 @@ impl Node {
     pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
         let removed = {
             let mut guard = self.connections.lock().await;
-            guard.remove(peer_id).await
+            guard.remove(peer_id)
         };
-        if let Some(mut conn) = removed {
+        if let Some(conn) = removed {
             let _ = conn.close().await;
         }
         self.peer_manager.remove(peer_id).await;
@@ -563,10 +559,16 @@ impl Node {
         };
 
         let bytes = encode_frame(&frame);
-        let mut guard = self.connections.lock().await;
-        let conn = guard.get_mut(peer_id).await.ok_or_else(|| MlinkError::PeerGone {
-            peer_id: peer_id.to_string(),
-        })?;
+        // Clone the Arc<dyn Connection> under a brief lock, then release the
+        // map lock before the actual write. Otherwise a parked reader holding
+        // the map lock during `read().await` would block every `send_raw` in
+        // the process — that was the exact BLE chat deadlock.
+        let conn = {
+            let guard = self.connections.lock().await;
+            guard.shared(peer_id).ok_or_else(|| MlinkError::PeerGone {
+                peer_id: peer_id.to_string(),
+            })?
+        };
         conn.write(&bytes).await
     }
 
@@ -611,16 +613,13 @@ impl Node {
     }
 
     pub async fn recv_raw(&self, peer_id: &str) -> Result<(Frame, Vec<u8>)> {
-        let bytes = {
-            let mut guard = self.connections.lock().await;
-            let conn = guard
-                .get_mut(peer_id)
-                .await
-                .ok_or_else(|| MlinkError::PeerGone {
-                    peer_id: peer_id.to_string(),
-                })?;
-            conn.read().await?
+        let conn = {
+            let guard = self.connections.lock().await;
+            guard.shared(peer_id).ok_or_else(|| MlinkError::PeerGone {
+                peer_id: peer_id.to_string(),
+            })?
         };
+        let bytes = conn.read().await?;
 
         let frame = decode_frame(&bytes)?;
         let (compressed, encrypted, _msg_type) = decode_flags(frame.flags);
@@ -720,16 +719,17 @@ async fn recv_once(
     encrypt: bool,
     peer_id: &str,
 ) -> Result<(MessageType, Vec<u8>)> {
-    let bytes = {
-        let mut guard = connections.lock().await;
-        let conn = guard
-            .get_mut(peer_id)
-            .await
-            .ok_or_else(|| MlinkError::PeerGone {
-                peer_id: peer_id.to_string(),
-            })?;
-        conn.read().await?
+    // Clone the Arc<dyn Connection> under the map lock, then release it
+    // before awaiting read. Holding the map lock across read().await is what
+    // caused the BLE chat deadlock: a parked reader blocked every concurrent
+    // send_raw on the same Node.
+    let conn = {
+        let guard = connections.lock().await;
+        guard.shared(peer_id).ok_or_else(|| MlinkError::PeerGone {
+            peer_id: peer_id.to_string(),
+        })?
     };
+    let bytes = conn.read().await?;
 
     let frame = decode_frame(&bytes)?;
     let (compressed, encrypted, msg_type) = decode_flags(frame.flags);
@@ -967,8 +967,7 @@ mod tests {
             room_hash: Some(room),
         };
         let driver = tokio::spawn(async move {
-            let mut cb: Box<dyn Connection> = Box::new(cb);
-            perform_handshake(cb.as_mut(), &hs_b).await.expect("peer hs");
+            perform_handshake(&cb, &hs_b).await.expect("peer hs");
         });
 
         let got = node_a
@@ -1007,10 +1006,9 @@ mod tests {
             room_hash: bogus_room,
         };
         let driver = tokio::spawn(async move {
-            let mut cb: Box<dyn Connection> = Box::new(cb);
             // The peer will get either a handshake reply or a closed socket;
             // both are acceptable here — we only assert the local rejection.
-            let _ = perform_handshake(cb.as_mut(), &hs_b).await;
+            let _ = perform_handshake(&cb, &hs_b).await;
         });
 
         let err = node_a
@@ -1071,8 +1069,7 @@ mod tests {
             room_hash: Some(room_b),
         };
         let driver = tokio::spawn(async move {
-            let mut cb: Box<dyn Connection> = Box::new(cb);
-            perform_handshake(cb.as_mut(), &hs_b).await.expect("peer hs");
+            perform_handshake(&cb, &hs_b).await.expect("peer hs");
         });
 
         let got = node_a
@@ -1112,8 +1109,7 @@ mod tests {
             room_hash: Some([0xCC; 8]),
         };
         let driver = tokio::spawn(async move {
-            let mut cb: Box<dyn Connection> = Box::new(cb);
-            let _ = perform_handshake(cb.as_mut(), &hs_b).await;
+            let _ = perform_handshake(&cb, &hs_b).await;
         });
 
         let err = node_a
@@ -1133,7 +1129,7 @@ mod tests {
             .await
             .expect("new");
 
-        let (a, mut b) = crate::transport::mock::mock_pair();
+        let (a, b) = crate::transport::mock::mock_pair();
         node.attach_connection("mock-peer-b".into(), Box::new(a)).await;
 
         assert_eq!(node.connection_count().await, 1);
@@ -1194,8 +1190,7 @@ mod tests {
             room_hash: None,
         };
         let driver = tokio::spawn(async move {
-            let mut cb: Box<dyn Connection> = Box::new(cb);
-            let _ = perform_handshake(cb.as_mut(), &hs_b).await;
+            let _ = perform_handshake(&cb, &hs_b).await;
         });
 
         let got = node_a
@@ -1273,5 +1268,75 @@ mod tests {
         }
 
         handle.abort();
+    }
+
+    /// Regression test for the BLE chat deadlock: a reader parked in
+    /// `conn.read().await` must not block a concurrent `send_raw` on the same
+    /// Node. Before the SharedConnection refactor, `recv_once` held
+    /// `connections.lock().await` across the read, and `send_raw` needed the
+    /// same mutex — so a peer that never sent a byte silently stalled every
+    /// outbound message the node tried to make.
+    #[tokio::test]
+    async fn send_raw_not_blocked_by_parked_reader() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A connection whose read() hangs forever (like a BLE central that
+        // isn't yet writing) but whose write() succeeds and records calls via
+        // a shared counter. The counter lives outside the conn so the test can
+        // observe writes without holding a second reference to the trait obj.
+        struct HangingReadConn {
+            id: String,
+            writes: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Connection for HangingReadConn {
+            async fn read(&self) -> Result<Vec<u8>> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            async fn write(&self, _data: &[u8]) -> Result<()> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+            fn peer_id(&self) -> &str {
+                &self.id
+            }
+        }
+
+        let _tmp = set_tmp_home();
+        let trust_tmp = tempfile::tempdir().expect("tmp");
+        let node = Node::new(tmp_config(trust_tmp.path().join("t.json")))
+            .await
+            .expect("new");
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let conn = HangingReadConn {
+            id: "stuck-peer".into(),
+            writes: Arc::clone(&writes),
+        };
+        node.attach_connection("stuck-peer".into(), Box::new(conn)).await;
+
+        // Park a reader. It will hang forever inside conn.read() — exactly the
+        // shape of the BLE chat host waiting on the client's first byte.
+        let reader_handle = node.spawn_peer_reader("stuck-peer".into());
+
+        // Give the reader a beat to reach its pending read.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Sending must complete on its own without the reader making progress.
+        // If the old per-map-mutex deadlock is back, this future will hang and
+        // the tokio::time::timeout below will trip.
+        let send_fut = node.send_raw("stuck-peer", MessageType::Message, b"hi");
+        tokio::time::timeout(Duration::from_secs(2), send_fut)
+            .await
+            .expect("send_raw must not be blocked by parked reader")
+            .expect("send ok");
+
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        reader_handle.abort();
     }
 }

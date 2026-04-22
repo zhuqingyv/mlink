@@ -950,7 +950,7 @@ impl MacPeripheralConnection {
 
 #[async_trait::async_trait]
 impl Connection for MacPeripheralConnection {
-    async fn read(&mut self) -> Result<Vec<u8>> {
+    async fn read(&self) -> Result<Vec<u8>> {
         match self.rx.lock().await.recv().await {
             Some(bytes) => Ok(bytes),
             None => Err(MlinkError::PeerGone {
@@ -959,7 +959,7 @@ impl Connection for MacPeripheralConnection {
         }
     }
 
-    async fn write(&mut self, data: &[u8]) -> Result<()> {
+    async fn write(&self, data: &[u8]) -> Result<()> {
         // CoreBluetooth's `updateValue:forCharacteristic:onSubscribedCentrals:`
         // returns `false` when the internal send queue is full; the correct
         // recovery path is to wait for `peripheralManagerIsReadyToUpdateSubscribers:`
@@ -978,7 +978,7 @@ impl Connection for MacPeripheralConnection {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         // Advertising lifetime is owned by MacPeripheral, not by any single
         // inbound connection. Stopping it here would kill discoverability for
         // every peer after the first mismatched/aborted handshake, so we only

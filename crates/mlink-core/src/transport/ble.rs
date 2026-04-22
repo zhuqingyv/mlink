@@ -342,7 +342,7 @@ impl Transport for BleTransport {
 
         Ok(Box::new(BleConnection {
             peer_id,
-            peripheral: Some(peripheral),
+            peripheral: Mutex::new(Some(peripheral)),
             tx_char,
             rx_char,
             notifications: Arc::new(Mutex::new(Some(notifications))),
@@ -417,7 +417,12 @@ async fn find_peripheral(adapter: &Adapter, peer_id: &str) -> Result<Peripheral>
 
 pub struct BleConnection {
     peer_id: String,
-    peripheral: Option<Peripheral>,
+    // Wrapped in a Mutex so `close` can `.take()` it while read/write hold
+    // only &self. btleplug's Peripheral methods already accept &self, so
+    // write's lock is only held across the enqueue — not the full
+    // characteristic write — which keeps it short enough not to stall a
+    // concurrent reader in practice.
+    peripheral: Mutex<Option<Peripheral>>,
     tx_char: Characteristic,
     rx_char: Characteristic,
     notifications: Arc<Mutex<Option<NotificationStream>>>,
@@ -432,7 +437,7 @@ impl BleConnection {
 
 #[async_trait]
 impl Connection for BleConnection {
-    async fn read(&mut self) -> Result<Vec<u8>> {
+    async fn read(&self) -> Result<Vec<u8>> {
         let mut guard = self.notifications.lock().await;
         let stream = guard.as_mut().ok_or_else(|| MlinkError::PeerGone {
             peer_id: self.peer_id.clone(),
@@ -447,19 +452,33 @@ impl Connection for BleConnection {
         }
     }
 
-    async fn write(&mut self, data: &[u8]) -> Result<()> {
-        let peripheral = self.peripheral.as_ref().ok_or_else(|| MlinkError::PeerGone {
-            peer_id: self.peer_id.clone(),
-        })?;
+    async fn write(&self, data: &[u8]) -> Result<()> {
+        // Clone the Peripheral handle out under the short-lived mutex so the
+        // actual `.write()` (which may block on GATT ACKs) runs without
+        // keeping the lock. btleplug's Peripheral is an Arc internally, so
+        // clones are cheap and all share the same underlying connection.
+        let peripheral = {
+            let guard = self.peripheral.lock().await;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| MlinkError::PeerGone {
+                    peer_id: self.peer_id.clone(),
+                })?
+        };
         peripheral
             .write(&self.tx_char, data, WriteType::WithoutResponse)
             .await?;
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         self.notifications.lock().await.take();
-        if let Some(p) = self.peripheral.take() {
+        let taken = {
+            let mut guard = self.peripheral.lock().await;
+            guard.take()
+        };
+        if let Some(p) = taken {
             let _ = p.unsubscribe(&self.rx_char).await;
             p.disconnect().await?;
         }

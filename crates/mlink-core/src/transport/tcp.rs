@@ -5,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 use crate::protocol::errors::{MlinkError, Result};
 
@@ -170,14 +172,21 @@ impl Transport for TcpTransport {
 }
 
 pub struct TcpConnection {
-    stream: Option<TcpStream>,
+    // Split the stream so a reader task parked in `read_exact` doesn't block
+    // a concurrent writer. Each half is behind its own async mutex so the
+    // Node can hand the same `Arc<dyn Connection>` to both a reader and a
+    // writer without stepping on each other's `&mut` borrows.
+    read_half: Mutex<Option<OwnedReadHalf>>,
+    write_half: Mutex<Option<OwnedWriteHalf>>,
     peer_id: String,
 }
 
 impl TcpConnection {
     pub fn new(stream: TcpStream, peer_id: impl Into<String>) -> Self {
+        let (r, w) = stream.into_split();
         Self {
-            stream: Some(stream),
+            read_half: Mutex::new(Some(r)),
+            write_half: Mutex::new(Some(w)),
             peer_id: peer_id.into(),
         }
     }
@@ -185,8 +194,9 @@ impl TcpConnection {
 
 #[async_trait]
 impl Connection for TcpConnection {
-    async fn read(&mut self) -> Result<Vec<u8>> {
-        let stream = self.stream.as_mut().ok_or_else(|| MlinkError::PeerGone {
+    async fn read(&self) -> Result<Vec<u8>> {
+        let mut guard = self.read_half.lock().await;
+        let stream = guard.as_mut().ok_or_else(|| MlinkError::PeerGone {
             peer_id: self.peer_id.clone(),
         })?;
         let mut len_buf = [0u8; 4];
@@ -199,8 +209,9 @@ impl Connection for TcpConnection {
         Ok(payload)
     }
 
-    async fn write(&mut self, data: &[u8]) -> Result<()> {
-        let stream = self.stream.as_mut().ok_or_else(|| MlinkError::PeerGone {
+    async fn write(&self, data: &[u8]) -> Result<()> {
+        let mut guard = self.write_half.lock().await;
+        let stream = guard.as_mut().ok_or_else(|| MlinkError::PeerGone {
             peer_id: self.peer_id.clone(),
         })?;
         let len = u32::try_from(data.len()).map_err(|_| MlinkError::PayloadTooLarge {
@@ -215,9 +226,12 @@ impl Connection for TcpConnection {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
-        if let Some(mut stream) = self.stream.take() {
-            match stream.shutdown().await {
+    async fn close(&self) -> Result<()> {
+        // Drop the read half so any parked reader observes EOF.
+        self.read_half.lock().await.take();
+        let taken = self.write_half.lock().await.take();
+        if let Some(mut w) = taken {
+            match w.shutdown().await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {}
                 Err(e) => return Err(e.into()),

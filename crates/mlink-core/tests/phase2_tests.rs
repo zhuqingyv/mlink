@@ -132,21 +132,21 @@ fn test_frame_with_flags() {
 
 struct MockConnection {
     peer_id: String,
-    closed: bool,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
 impl Connection for MockConnection {
-    async fn read(&mut self) -> Result<Vec<u8>> {
+    async fn read(&self) -> Result<Vec<u8>> {
         Ok(b"mock-read".to_vec())
     }
 
-    async fn write(&mut self, _data: &[u8]) -> Result<()> {
+    async fn write(&self, _data: &[u8]) -> Result<()> {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
-        self.closed = true;
+    async fn close(&self) -> Result<()> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -188,14 +188,14 @@ impl Transport for MockTransport {
     async fn connect(&mut self, peer: &DiscoveredPeer) -> Result<Box<dyn Connection>> {
         Ok(Box::new(MockConnection {
             peer_id: peer.id.clone(),
-            closed: false,
+            closed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     async fn listen(&mut self) -> Result<Box<dyn Connection>> {
         Ok(Box::new(MockConnection {
             peer_id: "listener".into(),
-            closed: false,
+            closed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -233,9 +233,9 @@ async fn test_mock_transport_compiles() {
 
 #[tokio::test]
 async fn test_mock_connection_compiles() {
-    let mut conn: Box<dyn Connection> = Box::new(MockConnection {
+    let conn: Box<dyn Connection> = Box::new(MockConnection {
         peer_id: "peer-42".into(),
-        closed: false,
+        closed: std::sync::atomic::AtomicBool::new(false),
     });
     assert_eq!(conn.peer_id(), "peer-42");
 

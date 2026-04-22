@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::Mutex;
 
 use crate::protocol::errors::{MlinkError, Result};
 
@@ -9,41 +10,45 @@ use super::transport_trait::{
 
 pub struct MockConnection {
     peer_id: String,
-    tx: Option<Sender<Vec<u8>>>,
-    rx: Option<Receiver<Vec<u8>>>,
+    tx: Mutex<Option<Sender<Vec<u8>>>>,
+    rx: Mutex<Option<Receiver<Vec<u8>>>>,
 }
 
 impl MockConnection {
     pub fn new(peer_id: impl Into<String>, tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8>>) -> Self {
         Self {
             peer_id: peer_id.into(),
-            tx: Some(tx),
-            rx: Some(rx),
+            tx: Mutex::new(Some(tx)),
+            rx: Mutex::new(Some(rx)),
         }
     }
 }
 
 #[async_trait]
 impl Connection for MockConnection {
-    async fn read(&mut self) -> Result<Vec<u8>> {
-        let rx = self
-            .rx
-            .as_mut()
-            .ok_or_else(|| MlinkError::PeerGone {
-                peer_id: self.peer_id.clone(),
-            })?;
+    async fn read(&self) -> Result<Vec<u8>> {
+        let mut guard = self.rx.lock().await;
+        let rx = guard.as_mut().ok_or_else(|| MlinkError::PeerGone {
+            peer_id: self.peer_id.clone(),
+        })?;
         rx.recv().await.ok_or_else(|| MlinkError::PeerGone {
             peer_id: self.peer_id.clone(),
         })
     }
 
-    async fn write(&mut self, data: &[u8]) -> Result<()> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| MlinkError::PeerGone {
-                peer_id: self.peer_id.clone(),
-            })?;
+    async fn write(&self, data: &[u8]) -> Result<()> {
+        // Clone the Sender out under the short lock so the actual `.send`
+        // await runs without keeping the mutex — otherwise a blocked sender
+        // would also block a concurrent `close()` that needs to drop the tx.
+        let tx = {
+            let guard = self.tx.lock().await;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| MlinkError::PeerGone {
+                    peer_id: self.peer_id.clone(),
+                })?
+        };
         tx.send(data.to_vec())
             .await
             .map_err(|_| MlinkError::PeerGone {
@@ -51,9 +56,9 @@ impl Connection for MockConnection {
             })
     }
 
-    async fn close(&mut self) -> Result<()> {
-        self.tx.take();
-        self.rx.take();
+    async fn close(&self) -> Result<()> {
+        self.tx.lock().await.take();
+        self.rx.lock().await.take();
         Ok(())
     }
 
@@ -127,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_pair_roundtrip() {
-        let (mut a, mut b) = mock_pair();
+        let (a, b) = mock_pair();
         a.write(b"hello").await.unwrap();
         let got = b.read().await.unwrap();
         assert_eq!(got, b"hello");
@@ -139,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_ends_peer_read() {
-        let (mut a, mut b) = mock_pair();
+        let (a, b) = mock_pair();
         a.close().await.unwrap();
         let err = b.read().await.unwrap_err();
         assert!(matches!(err, MlinkError::PeerGone { .. }));
@@ -147,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_after_close_fails() {
-        let (mut a, _b) = mock_pair();
+        let (a, _b) = mock_pair();
         a.close().await.unwrap();
         let err = a.write(b"x").await.unwrap_err();
         assert!(matches!(err, MlinkError::PeerGone { .. }));

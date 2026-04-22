@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::protocol::codec;
@@ -9,6 +10,15 @@ use crate::protocol::types::{
     encode_flags, Frame, Handshake, MessageType, MAGIC, PROTOCOL_VERSION,
 };
 use crate::transport::Connection;
+
+/// A connection shared between the `ConnectionManager` map and whatever task
+/// is currently driving read or write on it. `Connection` is `&self`-only, so
+/// a single `Arc<dyn Connection>` can safely be cloned into a peer-reader
+/// task and a sender at the same time — the implementation is responsible
+/// for its own internal serialisation. This avoids the old head-of-line
+/// block where a parked `read().await` on one shared mutex would also stall
+/// `send_raw()` on the same peer.
+pub type SharedConnection = Arc<dyn Connection>;
 
 /// Per-direction ceiling on the handshake. A slow or silent peer must never
 /// be allowed to freeze the caller's event loop (e.g. `cmd_serve`'s main
@@ -30,7 +40,7 @@ pub fn negotiate_role(my_uuid: &str, peer_uuid: &str) -> Role {
 }
 
 pub struct ConnectionManager {
-    conns: HashMap<String, Box<dyn Connection>>,
+    conns: HashMap<String, SharedConnection>,
 }
 
 impl ConnectionManager {
@@ -40,20 +50,24 @@ impl ConnectionManager {
         }
     }
 
-    pub async fn add(&mut self, id: String, conn: Box<dyn Connection>) {
+    pub fn add(&mut self, id: String, conn: SharedConnection) {
         self.conns.insert(id, conn);
     }
 
-    pub async fn remove(&mut self, id: &str) -> Option<Box<dyn Connection>> {
+    pub fn remove(&mut self, id: &str) -> Option<SharedConnection> {
         self.conns.remove(id)
     }
 
-    pub async fn get(&self, id: &str) -> Option<&Box<dyn Connection>> {
-        self.conns.get(id)
+    /// Clone the shared handle for `id`, if any. Callers should hold the
+    /// outer map lock only long enough to clone — the actual read/write
+    /// runs against the returned Arc with the map lock released, so
+    /// a parked read cannot stall writes on the same or other peers.
+    pub fn shared(&self, id: &str) -> Option<SharedConnection> {
+        self.conns.get(id).cloned()
     }
 
-    pub async fn get_mut(&mut self, id: &str) -> Option<&mut Box<dyn Connection>> {
-        self.conns.get_mut(id)
+    pub fn contains(&self, id: &str) -> bool {
+        self.conns.contains_key(id)
     }
 
     pub fn list_ids(&self) -> Vec<String> {
@@ -72,7 +86,7 @@ impl Default for ConnectionManager {
 }
 
 pub async fn perform_handshake(
-    conn: &mut dyn Connection,
+    conn: &dyn Connection,
     local_handshake: &Handshake,
 ) -> Result<Handshake> {
     let payload = codec::encode(local_handshake)?;
@@ -156,14 +170,14 @@ mod tests {
         struct SilentConn;
         #[async_trait]
         impl Connection for SilentConn {
-            async fn read(&mut self) -> Result<Vec<u8>> {
+            async fn read(&self) -> Result<Vec<u8>> {
                 std::future::pending::<()>().await;
                 unreachable!()
             }
-            async fn write(&mut self, _data: &[u8]) -> Result<()> {
+            async fn write(&self, _data: &[u8]) -> Result<()> {
                 Ok(())
             }
-            async fn close(&mut self) -> Result<()> {
+            async fn close(&self) -> Result<()> {
                 Ok(())
             }
             fn peer_id(&self) -> &str {
@@ -171,13 +185,13 @@ mod tests {
             }
         }
 
-        let mut conn = SilentConn;
+        let conn = SilentConn;
         // Pause tokio's clock so the 10s constant doesn't actually wait; we
         // advance virtual time instead and still exercise the real timeout
         // logic in perform_handshake.
         tokio::time::pause();
         let handle = tokio::spawn(async move {
-            perform_handshake(&mut conn, &sample_handshake("me")).await
+            perform_handshake(&conn, &sample_handshake("me")).await
         });
         // Step past the read ceiling.
         tokio::time::advance(HANDSHAKE_IO_TIMEOUT + Duration::from_millis(1)).await;
@@ -196,7 +210,7 @@ mod tests {
 
     #[async_trait]
     impl Connection for MockConn {
-        async fn read(&mut self) -> Result<Vec<u8>> {
+        async fn read(&self) -> Result<Vec<u8>> {
             let mut guard = self.reads.lock().await;
             if guard.is_empty() {
                 return Err(MlinkError::PeerGone {
@@ -205,11 +219,11 @@ mod tests {
             }
             Ok(guard.remove(0))
         }
-        async fn write(&mut self, data: &[u8]) -> Result<()> {
+        async fn write(&self, data: &[u8]) -> Result<()> {
             self.writes.lock().await.push(data.to_vec());
             Ok(())
         }
-        async fn close(&mut self) -> Result<()> {
+        async fn close(&self) -> Result<()> {
             Ok(())
         }
         fn peer_id(&self) -> &str {
@@ -228,8 +242,8 @@ mod tests {
     #[tokio::test]
     async fn manager_add_and_count() {
         let mut mgr = ConnectionManager::new();
-        mgr.add("a".into(), Box::new(make_mock("a"))).await;
-        mgr.add("b".into(), Box::new(make_mock("b"))).await;
+        mgr.add("a".into(), Arc::new(make_mock("a")));
+        mgr.add("b".into(), Arc::new(make_mock("b")));
         assert_eq!(mgr.count(), 2);
         let mut ids = mgr.list_ids();
         ids.sort();
@@ -239,20 +253,20 @@ mod tests {
     #[tokio::test]
     async fn manager_remove_returns_conn() {
         let mut mgr = ConnectionManager::new();
-        mgr.add("a".into(), Box::new(make_mock("a"))).await;
-        let removed = mgr.remove("a").await;
+        mgr.add("a".into(), Arc::new(make_mock("a")));
+        let removed = mgr.remove("a");
         assert!(removed.is_some());
         assert_eq!(mgr.count(), 0);
-        assert!(mgr.remove("a").await.is_none());
+        assert!(mgr.remove("a").is_none());
     }
 
     #[tokio::test]
-    async fn manager_get_returns_ref() {
+    async fn manager_shared_returns_clone() {
         let mut mgr = ConnectionManager::new();
-        mgr.add("a".into(), Box::new(make_mock("a"))).await;
-        let got = mgr.get("a").await.expect("present");
+        mgr.add("a".into(), Arc::new(make_mock("a")));
+        let got = mgr.shared("a").expect("present");
         assert_eq!(got.peer_id(), "a");
-        assert!(mgr.get("missing").await.is_none());
+        assert!(mgr.shared("missing").is_none());
     }
 
     fn sample_handshake(uuid: &str) -> Handshake {
@@ -285,14 +299,14 @@ mod tests {
 
         let reads = Arc::new(Mutex::new(vec![peer_bytes]));
         let writes: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut conn = MockConn {
+        let conn = MockConn {
             id: "peer".into(),
             reads: reads.clone(),
             writes: writes.clone(),
         };
 
         let local_hs = sample_handshake("local-uuid");
-        let got = perform_handshake(&mut conn, &local_hs).await.expect("hs");
+        let got = perform_handshake(&conn, &local_hs).await.expect("hs");
 
         assert_eq!(got, peer_hs);
 
@@ -318,12 +332,12 @@ mod tests {
             payload: vec![],
         };
         let reads = Arc::new(Mutex::new(vec![encode_frame(&bogus_frame)]));
-        let mut conn = MockConn {
+        let conn = MockConn {
             id: "peer".into(),
             reads,
             writes: Arc::new(Mutex::new(Vec::new())),
         };
-        let err = perform_handshake(&mut conn, &sample_handshake("me"))
+        let err = perform_handshake(&conn, &sample_handshake("me"))
             .await
             .unwrap_err();
         assert!(matches!(err, MlinkError::CodecError(_)));
@@ -349,12 +363,12 @@ mod tests {
         };
 
         let reads = Arc::new(Mutex::new(vec![encode_frame(&peer_frame)]));
-        let mut conn = MockConn {
+        let conn = MockConn {
             id: "p".into(),
             reads,
             writes: Arc::new(Mutex::new(Vec::new())),
         };
-        let got = perform_handshake(&mut conn, &sample_handshake("me"))
+        let got = perform_handshake(&conn, &sample_handshake("me"))
             .await
             .expect("hs");
         assert_eq!(got, peer_hs);
