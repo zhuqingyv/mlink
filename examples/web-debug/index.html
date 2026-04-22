@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mlink WS Debug</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121821;
+    --panel-2: #0f141b;
+    --border: #1f2a37;
+    --fg: #d7dde5;
+    --muted: #8a94a3;
+    --accent: #4ea1ff;
+    --ok: #3ddc84;
+    --err: #ff5d5d;
+    --warn: #ffb454;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  button, input, select {
+    font-family: inherit;
+    font-size: inherit;
+    color: var(--fg);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    outline: none;
+  }
+  button {
+    cursor: pointer;
+    background: #182230;
+  }
+  button:hover { background: #203044; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: #1e4b82; border-color: #2b6fb8; }
+  button.primary:hover { background: #255a9e; }
+  button.danger { background: #6b1f1f; border-color: #8a2a2a; }
+  button.danger:hover { background: #852828; }
+  input[type="text"] { width: 100%; }
+  input::placeholder { color: #51606f; }
+
+  /* Layout */
+  .app {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    height: 100vh;
+  }
+  .topbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar .title {
+    font-weight: 600;
+    color: var(--accent);
+    margin-right: 6px;
+    letter-spacing: 0.3px;
+  }
+  .topbar .url { flex: 1; min-width: 220px; }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: #0f1620;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--err);
+    box-shadow: 0 0 6px rgba(255,93,93,0.6);
+  }
+  .status.ok .dot { background: var(--ok); box-shadow: 0 0 6px rgba(61,220,132,0.6); }
+  .status.warn .dot { background: var(--warn); box-shadow: 0 0 6px rgba(255,180,84,0.6); }
+  .uuid { color: var(--muted); font-size: 12px; word-break: break-all; }
+
+  .main {
+    display: grid;
+    grid-template-columns: 240px 1fr 260px;
+    min-height: 0;
+  }
+  .col {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    border-right: 1px solid var(--border);
+  }
+  .col:last-child { border-right: none; }
+  .section-title {
+    padding: 8px 10px;
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--muted);
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  /* Left: rooms */
+  .rooms-actions { display: flex; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border); }
+  .rooms-actions input { flex: 1; }
+  .rooms-list { overflow-y: auto; flex: 1; }
+  .room-item {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .room-item:hover { background: #141c26; }
+  .room-item.active {
+    background: #112033;
+    border-left: 3px solid var(--accent);
+    padding-left: 7px;
+  }
+  .room-code { color: var(--fg); }
+  .room-item .leave {
+    font-size: 11px;
+    padding: 2px 6px;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid var(--border);
+  }
+  .room-item .leave:hover { color: var(--err); border-color: var(--err); }
+  .empty {
+    padding: 12px;
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+  }
+
+  /* Center: messages */
+  .center { overflow: hidden; }
+  .msg-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 10px;
+    background: var(--panel-2);
+  }
+  .msg {
+    padding: 6px 8px;
+    border-left: 3px solid #2b3a4d;
+    margin-bottom: 6px;
+    background: #0d131b;
+    border-radius: 3px;
+  }
+  .msg.self { border-left-color: var(--accent); }
+  .msg.remote { border-left-color: #7ed957; }
+  .msg.system { border-left-color: var(--warn); color: var(--muted); font-style: italic; }
+  .msg.error { border-left-color: var(--err); color: var(--err); }
+  .msg-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 2px;
+  }
+  .msg-body { word-break: break-word; white-space: pre-wrap; }
+  .send-box {
+    display: flex;
+    gap: 6px;
+    padding: 8px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .send-box input { flex: 1; }
+  .send-hint {
+    padding: 4px 10px;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+  }
+
+  /* Right: peers */
+  .peers-list { overflow-y: auto; flex: 1; }
+  .peer-item {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .peer-name { color: var(--fg); }
+  .peer-id { color: var(--muted); font-size: 11px; word-break: break-all; }
+
+  /* Log */
+  .log-wrap {
+    height: 180px;
+    display: flex;
+    flex-direction: column;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .log-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .log-head .controls { display: flex; gap: 6px; }
+  .log-head .controls label {
+    font-size: 11px;
+    color: var(--muted);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .log-list {
+    overflow-y: auto;
+    flex: 1;
+    padding: 6px 10px;
+    font-size: 12px;
+    background: #080b10;
+  }
+  .log-entry {
+    padding: 2px 0;
+    border-bottom: 1px dotted #1a2230;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-entry .arrow { display: inline-block; width: 14px; font-weight: 600; }
+  .log-entry.out .arrow { color: var(--accent); }
+  .log-entry.in .arrow { color: var(--ok); }
+  .log-entry.warn { color: var(--warn); }
+  .log-entry.err { color: var(--err); }
+  .log-ts { color: var(--muted); margin-right: 6px; }
+
+  /* Mobile */
+  @media (max-width: 900px) {
+    .main { grid-template-columns: 1fr; grid-auto-rows: auto; }
+    .col { border-right: none; border-bottom: 1px solid var(--border); max-height: 240px; }
+    .col.center { max-height: none; min-height: 300px; }
+    .log-wrap { height: 160px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <span class="title">mlink WS Debug</span>
+    <input type="text" class="url" id="wsUrl" value="ws://127.0.0.1:7890/ws" placeholder="ws://host:port/ws">
+    <button id="btnConnect" class="primary">Connect</button>
+    <button id="btnDisconnect" class="danger" disabled>Disconnect</button>
+    <span class="status" id="connStatus"><span class="dot"></span><span id="connText">disconnected</span></span>
+    <span class="uuid" id="uuidText"></span>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <!-- Left: rooms -->
+    <div class="col">
+      <div class="section-title">Rooms</div>
+      <div class="rooms-actions">
+        <input type="text" id="roomInput" placeholder="room code">
+        <button id="btnJoin">Join</button>
+      </div>
+      <div class="rooms-list" id="roomsList">
+        <div class="empty">no rooms joined</div>
+      </div>
+    </div>
+
+    <!-- Center: messages -->
+    <div class="col center">
+      <div class="section-title">
+        <span>Messages</span>
+        <span id="currentRoomLabel" style="color:var(--accent);text-transform:none;">(no room)</span>
+      </div>
+      <div class="msg-list" id="msgList"></div>
+      <div class="send-box">
+        <input type="text" id="sendInput" placeholder="type a message and press Enter" disabled>
+        <button id="btnSend" disabled>Send</button>
+      </div>
+      <div class="send-hint" id="sendHint">select a room to send messages</div>
+    </div>
+
+    <!-- Right: peers -->
+    <div class="col">
+      <div class="section-title">
+        <span>Peers</span>
+        <span id="peerCount" style="color:var(--muted);text-transform:none;"></span>
+      </div>
+      <div class="peers-list" id="peersList">
+        <div class="empty">no peers</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom: raw log -->
+  <div class="log-wrap">
+    <div class="log-head">
+      <span style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);">Raw Log</span>
+      <div class="controls">
+        <label><input type="checkbox" id="logPing" checked> show ping/pong</label>
+        <button id="btnClearLog">clear</button>
+        <button id="btnPing">ping</button>
+      </div>
+    </div>
+    <div class="log-list" id="logList"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // --- state ---
+  let ws = null;
+  let idSeq = 1;
+  const rooms = new Map();   // room -> { peers: Map<peer_id, {name}> }
+  let currentRoom = null;
+
+  // --- dom refs ---
+  const $ = (id) => document.getElementById(id);
+  const wsUrl = $("wsUrl");
+  const btnConnect = $("btnConnect");
+  const btnDisconnect = $("btnDisconnect");
+  const connStatus = $("connStatus");
+  const connText = $("connText");
+  const uuidText = $("uuidText");
+  const roomInput = $("roomInput");
+  const btnJoin = $("btnJoin");
+  const roomsList = $("roomsList");
+  const currentRoomLabel = $("currentRoomLabel");
+  const msgList = $("msgList");
+  const sendInput = $("sendInput");
+  const btnSend = $("btnSend");
+  const sendHint = $("sendHint");
+  const peersList = $("peersList");
+  const peerCount = $("peerCount");
+  const logList = $("logList");
+  const logPing = $("logPing");
+  const btnClearLog = $("btnClearLog");
+  const btnPing = $("btnPing");
+
+  // --- helpers ---
+  const nowHHMMSS = () => {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,"0")}`;
+  };
+
+  const nextId = (prefix) => `${prefix}${idSeq++}`;
+
+  const setStatus = (state, txt) => {
+    connStatus.classList.remove("ok", "warn");
+    if (state === "ok") connStatus.classList.add("ok");
+    else if (state === "warn") connStatus.classList.add("warn");
+    connText.textContent = txt;
+  };
+
+  const atBottom = (el) => el.scrollHeight - el.clientHeight - el.scrollTop < 40;
+  const scrollBottom = (el) => { el.scrollTop = el.scrollHeight; };
+
+  // --- log ---
+  function log(dir, data, klass) {
+    const entry = document.createElement("div");
+    entry.className = "log-entry " + (klass || (dir === "out" ? "out" : "in"));
+    const ts = `<span class="log-ts">${nowHHMMSS()}</span>`;
+    const arrow = `<span class="arrow">${dir === "out" ? "→" : dir === "in" ? "←" : "·"}</span>`;
+    let body;
+    if (typeof data === "string") body = escapeHtml(data);
+    else {
+      try { body = escapeHtml(JSON.stringify(data)); }
+      catch { body = String(data); }
+    }
+    entry.innerHTML = ts + arrow + " " + body;
+    const stick = atBottom(logList);
+    logList.appendChild(entry);
+    if (stick) scrollBottom(logList);
+  }
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  btnClearLog.addEventListener("click", () => { logList.innerHTML = ""; });
+
+  // --- connection ---
+  function connect() {
+    const url = wsUrl.value.trim();
+    if (!url) return;
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      log("·", `failed to construct WebSocket: ${e.message}`, "err");
+      return;
+    }
+    setStatus("warn", "connecting…");
+    btnConnect.disabled = true;
+    btnDisconnect.disabled = false;
+    wsUrl.disabled = true;
+
+    ws.addEventListener("open", () => {
+      setStatus("warn", "connected (waiting ready)");
+      log("·", "socket open, sending hello", "warn");
+      sendRaw({ v: 1, type: "hello", payload: { client_name: "web-debug" } });
+    });
+    ws.addEventListener("close", (ev) => {
+      setStatus("err", `closed (code=${ev.code})`);
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+      wsUrl.disabled = false;
+      sendInput.disabled = true;
+      btnSend.disabled = true;
+      uuidText.textContent = "";
+      log("·", `socket closed: code=${ev.code} reason=${ev.reason || ""}`, "warn");
+      ws = null;
+    });
+    ws.addEventListener("error", () => {
+      log("·", "socket error", "err");
+    });
+    ws.addEventListener("message", (ev) => {
+      let obj;
+      try { obj = JSON.parse(ev.data); }
+      catch {
+        log("in", `non-JSON: ${ev.data}`, "warn");
+        return;
+      }
+      handleServerMsg(obj);
+    });
+  }
+  function disconnect() {
+    if (ws) {
+      try { ws.close(1000, "client disconnect"); } catch {}
+    }
+  }
+
+  function sendRaw(obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      log("·", "not connected, drop: " + JSON.stringify(obj), "err");
+      return false;
+    }
+    const isPing = obj && (obj.type === "ping" || obj.type === "pong");
+    if (!isPing || logPing.checked) log("out", obj);
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+
+  btnConnect.addEventListener("click", connect);
+  btnDisconnect.addEventListener("click", disconnect);
+  btnPing.addEventListener("click", () => sendRaw({ v: 1, type: "ping" }));
+
+  // --- server msg dispatch ---
+  function handleServerMsg(m) {
+    const isPong = m && m.type === "pong";
+    if (!isPong || logPing.checked) log("in", m);
+
+    const t = m.type || "";
+    const p = m.payload || {};
+    switch (t) {
+      case "ready": {
+        setStatus("ok", "ready");
+        uuidText.textContent = p.app_uuid ? `uuid=${p.app_uuid}` : "";
+        break;
+      }
+      case "ack": {
+        // server acknowledgement — just log
+        break;
+      }
+      case "error": {
+        const code = p.code || "error";
+        const msg = p.message || "";
+        log("in", `error code=${code} msg=${msg}`, "err");
+        appendSystemMsg(`error: ${code}${msg ? " — " + msg : ""}`, "error");
+        break;
+      }
+      case "room_state": {
+        handleRoomState(p);
+        break;
+      }
+      case "message": {
+        handleIncomingMessage(p);
+        break;
+      }
+      case "pong":
+        // already logged above
+        break;
+      default:
+        // unknown / future types — logged already
+        break;
+    }
+  }
+
+  // --- room state ---
+  function handleRoomState(p) {
+    const code = p.room || p.code;
+    if (!code) return;
+    if (!rooms.has(code)) rooms.set(code, { peers: new Map() });
+    const r = rooms.get(code);
+    r.peers.clear();
+    const peers = p.peers || [];
+    for (const peer of peers) {
+      const id = peer.peer_id || peer.id || peer.app_uuid || JSON.stringify(peer);
+      r.peers.set(id, { name: peer.peer_name || peer.name || "" });
+    }
+    renderRooms();
+    if (code === currentRoom) renderPeers();
+  }
+
+  function handleIncomingMessage(p) {
+    const room = p.room;
+    const peerId = p.peer_id || p.from || "?";
+    const inner = p.payload != null ? p.payload : p.data;
+    let text;
+    if (inner == null) text = "";
+    else if (typeof inner === "string") text = inner;
+    else if (inner && typeof inner === "object" && typeof inner.text === "string") text = inner.text;
+    else text = JSON.stringify(inner);
+    appendMessage({ room, peerId, text, ts: Date.now(), self: false });
+  }
+
+  // --- rooms ui ---
+  btnJoin.addEventListener("click", () => joinRoom());
+  roomInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") joinRoom();
+  });
+
+  function joinRoom() {
+    const code = roomInput.value.trim();
+    if (!code) return;
+    if (rooms.has(code)) {
+      setCurrentRoom(code);
+      return;
+    }
+    rooms.set(code, { peers: new Map() });
+    setCurrentRoom(code);
+    renderRooms();
+    sendRaw({ v: 1, id: nextId("j"), type: "join", payload: { room: code } });
+    roomInput.value = "";
+  }
+
+  function leaveRoom(code) {
+    sendRaw({ v: 1, id: nextId("l"), type: "leave", payload: { room: code } });
+    rooms.delete(code);
+    if (currentRoom === code) {
+      const next = rooms.keys().next().value || null;
+      setCurrentRoom(next);
+    }
+    renderRooms();
+  }
+
+  function setCurrentRoom(code) {
+    currentRoom = code;
+    currentRoomLabel.textContent = code ? `#${code}` : "(no room)";
+    const hasRoom = !!code;
+    sendInput.disabled = !hasRoom;
+    btnSend.disabled = !hasRoom;
+    sendHint.textContent = hasRoom
+      ? `sending to room #${code}`
+      : "select a room to send messages";
+    renderRooms();
+    renderPeers();
+    renderMessages();
+  }
+
+  function renderRooms() {
+    if (rooms.size === 0) {
+      roomsList.innerHTML = `<div class="empty">no rooms joined</div>`;
+      return;
+    }
+    roomsList.innerHTML = "";
+    for (const code of rooms.keys()) {
+      const div = document.createElement("div");
+      div.className = "room-item" + (code === currentRoom ? " active" : "");
+      const peersN = rooms.get(code).peers.size;
+      div.innerHTML = `<span class="room-code">#${escapeHtml(code)} <span style="color:var(--muted);font-size:11px;">(${peersN})</span></span>`;
+      const leave = document.createElement("button");
+      leave.className = "leave";
+      leave.textContent = "leave";
+      leave.addEventListener("click", (e) => {
+        e.stopPropagation();
+        leaveRoom(code);
+      });
+      div.appendChild(leave);
+      div.addEventListener("click", () => setCurrentRoom(code));
+      roomsList.appendChild(div);
+    }
+  }
+
+  function renderPeers() {
+    peersList.innerHTML = "";
+    if (!currentRoom || !rooms.has(currentRoom)) {
+      peersList.innerHTML = `<div class="empty">no peers</div>`;
+      peerCount.textContent = "";
+      return;
+    }
+    const r = rooms.get(currentRoom);
+    peerCount.textContent = r.peers.size ? `(${r.peers.size})` : "";
+    if (r.peers.size === 0) {
+      peersList.innerHTML = `<div class="empty">no peers</div>`;
+      return;
+    }
+    for (const [id, info] of r.peers) {
+      const div = document.createElement("div");
+      div.className = "peer-item";
+      div.innerHTML =
+        `<div class="peer-name">${escapeHtml(info.name || "(unnamed)")}</div>` +
+        `<div class="peer-id">${escapeHtml(id)}</div>`;
+      peersList.appendChild(div);
+    }
+  }
+
+  // --- messages ---
+  // Store per-room message history for view switching
+  const msgHistory = new Map();  // room -> [{peerId,text,ts,self,kind}]
+
+  function appendMessage(m) {
+    const room = m.room || currentRoom || "(unrouted)";
+    if (!msgHistory.has(room)) msgHistory.set(room, []);
+    msgHistory.get(room).push(m);
+    if (room === currentRoom) renderMessages();
+  }
+
+  function appendSystemMsg(text, kind) {
+    const room = currentRoom || "(system)";
+    if (!msgHistory.has(room)) msgHistory.set(room, []);
+    msgHistory.get(room).push({ room, peerId: "", text, ts: Date.now(), self: false, kind: kind || "system" });
+    if (room === currentRoom) renderMessages();
+  }
+
+  function renderMessages() {
+    msgList.innerHTML = "";
+    if (!currentRoom) return;
+    const list = msgHistory.get(currentRoom) || [];
+    const stick = atBottom(msgList) || list.length <= 1;
+    const frag = document.createDocumentFragment();
+    for (const m of list) {
+      const div = document.createElement("div");
+      const kind = m.kind || (m.self ? "self" : "remote");
+      div.className = "msg " + kind;
+      const t = new Date(m.ts);
+      const pad = (n) => String(n).padStart(2, "0");
+      const ts = `${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`;
+      const src = m.self ? "me" : (m.peerId || "");
+      div.innerHTML =
+        `<div class="msg-head"><span>${escapeHtml(src)}</span><span>${ts} · #${escapeHtml(m.room || "")}</span></div>` +
+        `<div class="msg-body">${escapeHtml(m.text || "")}</div>`;
+      frag.appendChild(div);
+    }
+    msgList.appendChild(frag);
+    if (stick) scrollBottom(msgList);
+  }
+
+  // --- send ---
+  btnSend.addEventListener("click", sendCurrent);
+  sendInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendCurrent(); }
+  });
+
+  function sendCurrent() {
+    const text = sendInput.value;
+    if (!text || !currentRoom) return;
+    const ok = sendRaw({
+      v: 1,
+      id: nextId("s"),
+      type: "send",
+      payload: { room: currentRoom, payload: { text } }
+    });
+    if (ok) {
+      appendMessage({ room: currentRoom, peerId: "", text, ts: Date.now(), self: true });
+      sendInput.value = "";
+    }
+  }
+
+  // --- init ---
+  setStatus("err", "disconnected");
+})();
+</script>
+</body>
+</html>
