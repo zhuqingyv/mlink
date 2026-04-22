@@ -1,11 +1,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use mlink_cli::{Cli, Commands, RoomAction, TransportKind, TrustAction};
-use mlink_core::api::stream::create_stream;
 use mlink_core::core::node::{Node, NodeConfig, NodeEvent};
 use mlink_core::core::room::{generate_room_code, room_hash, RoomManager};
 use mlink_core::core::scanner::Scanner;
@@ -16,7 +14,7 @@ use mlink_core::transport::ble::BleTransport;
 use mlink_core::transport::tcp::{probe_mdns_daemon, TcpTransport};
 use mlink_core::transport::{Connection, DiscoveredPeer, Transport};
 use tokio::signal;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -1317,43 +1315,13 @@ async fn cmd_send_room(
 }
 
 async fn send_file_to_peers(
-    node: &Node,
-    peers: &[String],
-    path: &PathBuf,
+    _node: &Node,
+    _peers: &[String],
+    _path: &PathBuf,
 ) -> Result<(), MlinkError> {
-    let data = std::fs::read(path)
-        .map_err(|e| MlinkError::HandlerError(format!("read {}: {e}", path.display())))?;
-    let node = Arc::new(unsafe_clone_node(node));
-    for peer_id in peers {
-        println!(
-            "[mlink] sending file {} ({} bytes) to {peer_id}",
-            path.display(),
-            data.len()
-        );
-        let mut writer = create_stream(Arc::clone(&node), peer_id, &data).await?;
-        writer.write(&data).await?;
-        let total = writer.total_chunks();
-        writer.finish().await?;
-        println!("[mlink] sent {} chunks to {peer_id}", total);
-    }
-    Ok(())
-}
-
-/// Stream API requires an `Arc<Node>`, but the Node was built locally as an
-/// owned value and we can't `Arc::new` it after the fact without giving up
-/// later mutable access. This reconstructs a new empty Node *shell* that
-/// shares the same trust store path; OK because `create_stream` only needs
-/// read-only references in the paths we use. This is a documented stop-gap
-/// for the CLI; the daemon path will own a real `Arc<Node>`.
-fn unsafe_clone_node(_n: &Node) -> Node {
-    // Safe fallback: we can't clone a Node, so we panic at runtime if
-    // anyone actually calls this before the daemon refactor lands.
-    // The `send --file` path is marked experimental; the tester can
-    // exercise the message path instead.
-    unimplemented!(
-        "file transfer over a short-lived CLI requires the daemon path (not yet wired); \
-         use `mlink send <code> <text>` for now"
-    )
+    Err(MlinkError::HandlerError(
+        "file transfer not yet implemented; use `mlink send <code> <text>` for now".into(),
+    ))
 }
 
 async fn cmd_listen(kind: TransportKind) -> Result<(), MlinkError> {
@@ -1437,7 +1405,6 @@ async fn cmd_connect(peer_id: String, kind: TransportKind) -> Result<(), MlinkEr
     println!("connecting to {peer_id}...");
     let app_uuid = node.connect_peer(transport.as_mut(), &discovered).await?;
     println!("connected (app_uuid={app_uuid})");
-    println!("TODO: verification-code prompt for first-time pairing");
     Ok(())
 }
 
@@ -1585,12 +1552,6 @@ async fn tcp_loopback_check() -> Result<u16, MlinkError> {
     Ok(port)
 }
 
-
-// Silence dead-code warning for `Mutex` import reserved for future daemon wiring.
-#[allow(dead_code)]
-fn _reserved_mutex() -> Mutex<()> {
-    Mutex::new(())
-}
 
 /// Outer timeout for connect_peer / accept_incoming. Picked larger than the
 /// 10s handshake IO ceiling in `perform_handshake` so an honest-but-slow peer

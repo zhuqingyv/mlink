@@ -384,6 +384,13 @@ impl Transport for BleTransport {
 
 /// Parse `<name>#<16 lowercase-hex>` into `(base_name, [u8; 8])`. Returns
 /// `None` if the suffix isn't present or isn't a valid 8-byte hex string.
+///
+/// NOTE: on macOS, CoreBluetooth does not surface the peripheral's advertised
+/// `CBAdvertisementDataLocalNameKey` to centrals in a reliable way
+/// (overflow-area truncation), so this parser is effectively a no-op there —
+/// room_hash is encoded via the service-UUID slot and exchanged in the
+/// handshake instead. Kept for other platforms (Linux/Android) where the
+/// local name round-trips through the advertisement payload intact.
 fn parse_room_hash_from_name(name: &str) -> Option<(String, [u8; 8])> {
     let hash_pos = name.rfind('#')?;
     let hex_str = &name[hash_pos + 1..];

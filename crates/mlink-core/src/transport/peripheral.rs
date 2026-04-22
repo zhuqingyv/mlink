@@ -131,6 +131,11 @@ pub struct MacPeripheral {
     /// are routed on per-central channels (see `per_central_tx`) so a single
     /// shared receiver can't swallow another central's frames.
     ctrl_events: Arc<Mutex<EventReceiver>>,
+    /// Held solely to keep the control-plane sender alive for the lifetime of
+    /// the peripheral. The delegate holds its own clone, but retaining one
+    /// here leaves the channel open for future direct-emission paths (e.g.
+    /// teardown events) without needing a long-lived keep-alive task.
+    _ctrl_tx: EventSender,
     /// Per-central inbound-bytes senders; populated on CentralSubscribed and
     /// torn down on unsubscribe. Shared with the delegate.
     per_central_tx: PerCentralTx,
@@ -278,14 +283,6 @@ impl MacPeripheral {
             ad_dict: _,
         } = holder;
 
-        // Keep the sender alive across the lifetime of the peripheral. The
-        // delegate holds its own clone, but we also keep one here for any
-        // future direct emission paths (e.g. teardown events).
-        tokio::spawn(async move {
-            let _keep_alive = tx;
-            tokio::time::sleep(Duration::from_secs(u64::MAX / 2)).await;
-        });
-
         Ok(Self {
             manager,
             _tx_char: tx_char,
@@ -294,6 +291,7 @@ impl MacPeripheral {
             _service: service,
             _delegate: delegate,
             ctrl_events: Arc::new(Mutex::new(rx)),
+            _ctrl_tx: tx,
             per_central_tx,
             subscribed,
             local_name,
