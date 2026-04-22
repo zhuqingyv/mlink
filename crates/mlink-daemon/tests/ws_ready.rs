@@ -10,6 +10,13 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[tokio::test]
 async fn ws_sends_ready_frame_on_connect() {
+    // Redirect the persistent rooms file to a temp path so the test cannot
+    // mutate the user's real `~/.mlink/rooms.json`.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let path = std::env::temp_dir().join(format!("mlink-ready-test-rooms-{}.json", nanos));
+    std::env::set_var("MLINK_ROOMS_FILE", &path);
+
     let state = build_state().await.expect("build_state");
     let app_uuid = state.node.app_uuid().to_string();
     let app = router(state);

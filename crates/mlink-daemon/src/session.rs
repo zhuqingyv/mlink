@@ -1,18 +1,18 @@
 //! Per-connection WS session. Parses envelopes, routes to handlers, and
-//! forwards Node events to the client based on its room subscription set.
+//! forwards Node events / routed backlog messages to the client based on its
+//! room subscription set.
 //!
-//! Each session owns a `HashSet<String>` of joined room codes. Node-level
-//! events (PeerConnected/Disconnected/MessageReceived) are forwarded only
-//! when the session has at least one active subscription — the daemon does
-//! not currently track per-peer room membership, so every joined client sees
-//! every message from every connected peer. That is acceptable for the
-//! single-device "my apps" use case the daemon targets; a stricter
-//! per-room fan-out would require Node to track which room_hash a peer
-//! handshook against, which is out of scope here.
+//! Sessions no longer own the room on behalf of the daemon. Subscription is
+//! purely a *routing filter*: the daemon is already joined to every room in
+//! the persistent RoomStore, and backlog messages accumulate in `state.queue`
+//! whether any WS client is listening or not. A `join` frame adds the code to
+//! the client's sub set and drains any accumulated backlog into the socket;
+//! `leave` removes the sub and, only if no other live session still holds the
+//! code, retires the room from the Node + RoomStore. A WS disconnect removes
+//! subs silently — daemon-side membership is unaffected.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::stream::StreamExt;
@@ -21,17 +21,24 @@ use mlink_core::core::room::room_hash;
 use mlink_core::protocol::types::MessageType;
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
 
 use crate::protocol::{
     codes, encode_frame, AckPayload, Envelope, ErrorPayload, HelloPayload, MessagePayload,
     PeerInfo, RoomPayload, RoomStatePayload, SendPayload,
 };
-use crate::{DaemonState, DAEMON_VERSION, WS_PROTOCOL_VERSION};
+use crate::queue::MessageEntry;
+use crate::{DaemonState, SessionEntry, SessionHandle, DAEMON_VERSION, WS_PROTOCOL_VERSION};
 
 /// Maximum accepted frame size, in bytes. Matches the product rule ("WS
 /// single message upper bound 1 MB"). Oversize frames are rejected with
 /// `payload_too_large` before being parsed.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Outbound mpsc capacity. Sized generously relative to `MAX_MESSAGES_PER_ROOM`
+/// so a join-time drain of one full backlog fits without back-pressure, while
+/// staying small enough that a wedged socket doesn't grow memory unboundedly.
+const OUTBOUND_CAPACITY: usize = 1024;
 
 pub async fn run(mut socket: WebSocket, state: DaemonState) {
     // ---- send `ready` -----
@@ -47,20 +54,21 @@ pub async fn run(mut socket: WebSocket, state: DaemonState) {
         return;
     }
 
-    // The joined-rooms set lives behind an Arc<Mutex> so the leave handler in
-    // *other* sessions can inspect it when deciding whether to retire a
-    // room_hash from the Node. Dropped on session exit — see the `retain`
-    // call at the bottom of this function.
-    let joined: Arc<StdMutex<HashSet<String>>> = Arc::new(StdMutex::new(HashSet::new()));
+    let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+    let handle: SessionHandle = Arc::new(StdMutex::new(SessionEntry {
+        subs: HashSet::new(),
+        tx,
+    }));
     {
         let mut sessions = state.sessions.lock().expect("sessions poisoned");
-        sessions.push(Arc::clone(&joined));
+        sessions.push(Arc::clone(&handle));
     }
     let mut events = state.node_events.subscribe();
 
-    // `StreamExt::next` on WebSocket gives us cancel-safe `Option<Result<Message>>`.
-    // We select between it and the event broadcast inside one loop so the
-    // session lifetime is bound to the socket, not to any background task.
+    // `StreamExt::next` on WebSocket is cancel-safe, as is `mpsc::Receiver::recv`
+    // and `broadcast::Receiver::recv`. All three drive one session lifetime —
+    // dropping the socket breaks the loop and deregisters from the sessions
+    // list.
     loop {
         tokio::select! {
             ws_msg = socket.next() => {
@@ -90,7 +98,7 @@ pub async fn run(mut socket: WebSocket, state: DaemonState) {
                             let _ = socket.send(Message::Text(err)).await;
                             continue;
                         }
-                        if !handle_text(&mut socket, &state, &joined, &t).await {
+                        if !handle_text(&mut socket, &state, &handle, &t).await {
                             break;
                         }
                     }
@@ -112,10 +120,19 @@ pub async fn run(mut socket: WebSocket, state: DaemonState) {
                     Message::Ping(_) | Message::Pong(_) => {}
                 }
             }
+            routed = rx.recv() => {
+                // Messages delivered by the central fan-out worker. `None`
+                // means every sender was dropped, which only happens at
+                // shutdown — we'd be about to exit anyway.
+                let Some(frame) = routed else { break; };
+                if !send(&mut socket, frame).await {
+                    break;
+                }
+            }
             ev = events.recv() => {
                 match ev {
                     Ok(ev) => {
-                        if !forward_event(&mut socket, &joined, ev).await {
+                        if !forward_peer_event(&mut socket, &handle, ev).await {
                             break;
                         }
                     }
@@ -128,26 +145,16 @@ pub async fn run(mut socket: WebSocket, state: DaemonState) {
         }
     }
 
-    // Deregister this session. The `Arc`-pointer compare is deliberate:
-    // HashSet<String> doesn't implement Eq-as-pointer, and two sessions that
-    // happened to join the same rooms would otherwise look equal.
+    // Deregister this session. The fan-out worker will notice the dropped
+    // sender on its next push and tolerate the failure, but removing the
+    // entry here keeps the list bounded.
     {
         let mut sessions = state.sessions.lock().expect("sessions poisoned");
-        sessions.retain(|s| !Arc::ptr_eq(s, &joined));
+        sessions.retain(|s| !Arc::ptr_eq(s, &handle));
     }
-    // If no other session still uses the rooms this one had joined, retire
-    // the hashes from the Node so further discovery doesn't accept peers on
-    // their behalf.
-    let codes = joined.lock().expect("joined poisoned").clone();
-    for code in codes {
-        let still_used = {
-            let sessions = state.sessions.lock().expect("sessions poisoned");
-            sessions.iter().any(|s| s.lock().expect("poisoned").contains(&code))
-        };
-        if !still_used {
-            state.node.remove_room_hash(&room_hash(&code));
-        }
-    }
+    // Disconnect path never retires daemon-level rooms: the daemon owns the
+    // membership and keeps its device-to-device connections alive even when
+    // no WS client is listening. Subscription state dies with the session.
 }
 
 /// Process one inbound text frame. Returns `false` when the socket went away
@@ -155,7 +162,7 @@ pub async fn run(mut socket: WebSocket, state: DaemonState) {
 async fn handle_text(
     socket: &mut WebSocket,
     state: &DaemonState,
-    joined: &Arc<StdMutex<HashSet<String>>>,
+    handle: &SessionHandle,
     text: &str,
 ) -> bool {
     let env: Envelope = match serde_json::from_str(text) {
@@ -189,9 +196,9 @@ async fn handle_text(
     }
     match env.ty.as_str() {
         "hello" => handle_hello(socket, state, env.id.as_deref(), env.payload).await,
-        "join" => handle_join(socket, state, joined, env.id.as_deref(), env.payload).await,
-        "leave" => handle_leave(socket, state, joined, env.id.as_deref(), env.payload).await,
-        "send" => handle_send(socket, state, joined, env.id.as_deref(), env.payload).await,
+        "join" => handle_join(socket, state, handle, env.id.as_deref(), env.payload).await,
+        "leave" => handle_leave(socket, state, handle, env.id.as_deref(), env.payload).await,
+        "send" => handle_send(socket, state, handle, env.id.as_deref(), env.payload).await,
         "ping" => handle_ping(socket, env.id.as_deref()).await,
         other => {
             send(
@@ -244,7 +251,7 @@ async fn handle_hello(
 async fn handle_join(
     socket: &mut WebSocket,
     state: &DaemonState,
-    joined: &Arc<StdMutex<HashSet<String>>>,
+    handle: &SessionHandle,
     id: Option<&str>,
     payload: Value,
 ) -> bool {
@@ -268,19 +275,47 @@ async fn handle_join(
         .await;
     }
     let hash = room_hash(&room.room);
+    // Daemon-level membership is idempotent — add_room_hash dedupes and
+    // RoomStore::add is a no-op if already present. We do it before touching
+    // the queue so a just-arrived peer message (if any) is keyed correctly.
     state.node.add_room_hash(hash);
-    joined.lock().expect("joined poisoned").insert(room.room.clone());
+    state.rooms.lock().expect("rooms poisoned").add(&room.room);
+
+    // Subscribe + drain atomically under the queue lock. Holding the queue
+    // lock blocks the central fan-out worker, guaranteeing that any backlog
+    // present at this moment has NOT been fanned to this session (subs was
+    // empty for this room), and any backlog that arrives after we release
+    // WILL be fanned (subs now contains the room). No duplication, no loss.
+    let drained = {
+        let mut q = state.queue.lock().expect("queue poisoned");
+        {
+            let mut entry = handle.lock().expect("session poisoned");
+            entry.subs.insert(room.room.clone());
+        }
+        q.drain(&room.room)
+    };
 
     if !send_ack_if_id(socket, id, "join").await {
         return false;
     }
-    send_room_state(socket, state, &room.room, true).await
+    if !send_room_state(socket, state, &room.room, true).await {
+        return false;
+    }
+    // Flush backlog. Ordering within a room is preserved because the queue is
+    // FIFO and we send before returning control to the outer select!, i.e.
+    // before any newly-routed message can reach the mpsc receiver.
+    for entry in drained {
+        if !send_backlog_entry(socket, &entry).await {
+            return false;
+        }
+    }
+    true
 }
 
 async fn handle_leave(
     socket: &mut WebSocket,
     state: &DaemonState,
-    joined: &Arc<StdMutex<HashSet<String>>>,
+    handle: &SessionHandle,
     id: Option<&str>,
     payload: Value,
 ) -> bool {
@@ -304,20 +339,28 @@ async fn handle_leave(
         .await;
     }
     let hash = room_hash(&room.room);
-    // The Node's room-hash set is shared across every WS client, so we only
-    // remove the hash when *no* other session still has that room joined.
-    // Without that check, two clients in the same room would each see their
-    // own "leave" pull the filter out from under the other.
-    let removed = joined.lock().expect("joined poisoned").remove(&room.room);
+    // Drop the subscription first, then — only if no other live session still
+    // has this room subscribed — retire daemon-level membership. A WS client
+    // that explicitly `leave`s has asked to stop caring about the room; when
+    // the last such client goes, the daemon does too.
+    let removed = {
+        let mut entry = handle.lock().expect("session poisoned");
+        entry.subs.remove(&room.room)
+    };
     if removed {
         let still_used = {
             let sessions = state.sessions.lock().expect("sessions poisoned");
-            sessions
-                .iter()
-                .any(|s| s.lock().expect("poisoned").contains(&room.room))
+            sessions.iter().any(|s| {
+                s.lock().expect("session poisoned").subs.contains(&room.room)
+            })
         };
         if !still_used {
             state.node.remove_room_hash(&hash);
+            state.rooms.lock().expect("rooms poisoned").remove(&room.room);
+            // Free the backlog bucket too: nobody will ever drain it, and
+            // new messages for that room would have nowhere routable to go
+            // once the Node stops accepting peers on its hash.
+            state.queue.lock().expect("queue poisoned").remove_room(&room.room);
         }
     }
 
@@ -330,7 +373,7 @@ async fn handle_leave(
 async fn handle_send(
     socket: &mut WebSocket,
     state: &DaemonState,
-    joined: &Arc<StdMutex<HashSet<String>>>,
+    handle: &SessionHandle,
     id: Option<&str>,
     payload: Value,
 ) -> bool {
@@ -353,7 +396,12 @@ async fn handle_send(
         )
         .await;
     }
-    if !joined.lock().expect("joined poisoned").contains(&send_payload.room) {
+    let is_subbed = handle
+        .lock()
+        .expect("session poisoned")
+        .subs
+        .contains(&send_payload.room);
+    if !is_subbed {
         return send(
             socket,
             encode_frame(
@@ -432,52 +480,26 @@ async fn handle_ping(socket: &mut WebSocket, id: Option<&str>) -> bool {
     send(socket, encode_frame("pong", id, serde_json::json!({}))).await
 }
 
-async fn forward_event(
+/// Forward peer connect/disconnect events. `MessageReceived` is deliberately
+/// ignored here — message routing goes through the central fan-out worker
+/// that queues and dispatches per-subscription, so handling it here would
+/// either duplicate delivery or race with the queue path.
+async fn forward_peer_event(
     socket: &mut WebSocket,
-    joined: &Arc<StdMutex<HashSet<String>>>,
+    handle: &SessionHandle,
     ev: NodeEvent,
 ) -> bool {
-    // Snapshot the joined set so we don't hold the lock across awaits.
     let codes: Vec<String> = {
-        let g = joined.lock().expect("joined poisoned");
-        if g.is_empty() {
+        let entry = handle.lock().expect("session poisoned");
+        if entry.subs.is_empty() {
             return true;
         }
-        g.iter().cloned().collect()
+        entry.subs.iter().cloned().collect()
     };
     match ev {
         NodeEvent::PeerConnected { .. } | NodeEvent::PeerDisconnected { .. } => {
-            // Re-emit `room_state` for every joined room so the client can
-            // refresh its peer list without re-querying.
             for code in &codes {
-                if !send_room_state_with_peers(socket, code, true).await {
-                    return false;
-                }
-            }
-            true
-        }
-        NodeEvent::MessageReceived { peer_id, payload } => {
-            // Parse payload back into JSON; fall back to the original utf-8
-            // string if it wasn't valid JSON (the CLI chat path sends plain
-            // text lines), or a placeholder for non-utf8 binary.
-            let value: Value = match std::str::from_utf8(&payload) {
-                Ok(s) => match serde_json::from_str(s) {
-                    Ok(v) => v,
-                    Err(_) => Value::String(s.to_string()),
-                },
-                Err(_) => Value::String(format!("<{} bytes binary>", payload.len())),
-            };
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            for code in &codes {
-                let frame = encode_frame(
-                    "message",
-                    None,
-                    MessagePayload { room: code, from: peer_id.clone(), payload: value.clone(), ts },
-                );
-                if !send(socket, frame).await {
+                if !send_room_state_empty_peers(socket, code, true).await {
                     return false;
                 }
             }
@@ -485,6 +507,20 @@ async fn forward_event(
         }
         _ => true,
     }
+}
+
+async fn send_backlog_entry(socket: &mut WebSocket, entry: &MessageEntry) -> bool {
+    let frame = encode_frame(
+        "message",
+        None,
+        MessagePayload {
+            room: &entry.room,
+            from: entry.from.clone(),
+            payload: entry.payload.clone(),
+            ts: entry.ts,
+        },
+    );
+    send(socket, frame).await
 }
 
 async fn send_room_state(
@@ -508,18 +544,14 @@ async fn send_room_state(
     send(socket, frame).await
 }
 
-async fn send_room_state_with_peers(
+async fn send_room_state_empty_peers(
     socket: &mut WebSocket,
     code: &str,
     joined: bool,
 ) -> bool {
-    // Called from `forward_event` where we don't have `state` in scope; callers
-    // of the event loop pass the socket only. We avoid the extra lookup by
-    // snapshotting current Node peers via a static accessor — but since we
-    // don't have one, use the joined flag shape that doesn't require peers.
-    // Future: thread `DaemonState` into `forward_event`. For now, emit an
-    // empty `peers` list so clients know to re-query (they do a fresh `join`
-    // round-trip for that today).
+    // Called from `forward_peer_event` which doesn't have `DaemonState` in
+    // scope. Clients that care about the fresh peer list will already issue a
+    // follow-up `join`; the event here is a cheap "something changed" nudge.
     let frame = encode_frame(
         "room_state",
         None,

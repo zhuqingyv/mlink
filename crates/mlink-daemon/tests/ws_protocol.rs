@@ -5,7 +5,9 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use mlink_daemon::{build_state, router};
+use mlink_core::core::room::room_hash;
+use mlink_daemon::queue::MessageEntry;
+use mlink_daemon::{build_state, router, DaemonState};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -21,6 +23,7 @@ async fn connect() -> Ws {
     // we do need the daemon to start without hitting BLE permissions on macOS.
     // TCP is the default and is safe to run headlessly — nothing else in these
     // tests drives real peer connections.
+    redirect_rooms_file();
     let state = build_state().await.expect("build_state");
     let app = router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -36,6 +39,24 @@ async fn connect() -> Ws {
     let ready = read_json(&mut ws).await;
     assert_eq!(ready["type"], "ready");
     ws
+}
+
+/// Point `MLINK_ROOMS_FILE` at a per-process temp path so these tests never
+/// touch the user's real `~/.mlink/rooms.json`. Idempotent — set once per
+/// process.
+fn redirect_rooms_file() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mlink-ws-test-rooms-{}-{}.json",
+            std::process::id(),
+            nanos
+        ));
+        std::env::set_var("MLINK_ROOMS_FILE", &path);
+    });
 }
 
 async fn send_json(ws: &mut Ws, v: Value) {
@@ -228,6 +249,7 @@ async fn oversize_frame_returns_payload_too_large() {
 async fn multi_client_each_has_own_rooms() {
     // Two clients attached to the same daemon. One joins, the other should
     // still be able to independently send `join`/`leave` and see its own acks.
+    redirect_rooms_file();
     let state = build_state().await.expect("build_state");
     let app = router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -261,4 +283,121 @@ async fn multi_client_each_has_own_rooms() {
     let ack_b = read_json(&mut b).await;
     assert_eq!(ack_b["id"], "jb");
     assert_eq!(ack_b["payload"]["type"], "join");
+}
+
+/// Stand up a daemon and hand back both a connected WS and the `DaemonState`
+/// so tests can poke the queue / RoomStore directly. Callers are responsible
+/// for redirecting `MLINK_ROOMS_FILE` beforehand when they need isolation.
+async fn connect_with_state() -> (Ws, DaemonState) {
+    redirect_rooms_file();
+    let state = build_state().await.expect("build_state");
+    let app = router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::task::yield_now().await;
+
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("connect");
+    let ready = read_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    (ws, state)
+}
+
+#[tokio::test]
+async fn disconnect_keeps_daemon_room_joined() {
+    // With the subscription-model refactor, a WS disconnect must NOT retire
+    // the room from the Node / RoomStore — the daemon owns membership so
+    // peer connections stay alive across client restarts.
+    let (mut ws, state) = connect_with_state().await;
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"314159"}}),
+    )
+    .await;
+    let _ack = read_json(&mut ws).await;
+    let _rs = read_json(&mut ws).await;
+
+    // Client vanishes without issuing `leave`.
+    drop(ws);
+    // Give the server a beat to notice the socket is gone.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let hashes = state.node.room_hashes();
+    assert!(
+        hashes.contains(&room_hash("314159")),
+        "daemon must stay joined after WS disconnect"
+    );
+    let listed = state.rooms.lock().unwrap().list();
+    assert!(
+        listed.iter().any(|c| c == "314159"),
+        "RoomStore must retain room after WS disconnect"
+    );
+}
+
+#[tokio::test]
+async fn explicit_leave_without_other_subscribers_retires_room() {
+    // `leave` is an explicit "stop caring about this room" signal. When the
+    // last live subscriber leaves, the daemon must remove the hash from the
+    // Node and drop it from the persistent store.
+    let (mut ws, state) = connect_with_state().await;
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"272727"}}),
+    )
+    .await;
+    let _ack = read_json(&mut ws).await;
+    let _rs = read_json(&mut ws).await;
+
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"l", "type":"leave", "payload":{"room":"272727"}}),
+    )
+    .await;
+    let _lack = read_json(&mut ws).await;
+    let _lrs = read_json(&mut ws).await;
+
+    let hashes = state.node.room_hashes();
+    assert!(
+        !hashes.contains(&room_hash("272727")),
+        "explicit leave must retire the room hash"
+    );
+    let listed = state.rooms.lock().unwrap().list();
+    assert!(!listed.iter().any(|c| c == "272727"));
+}
+
+#[tokio::test]
+async fn join_drains_backlog_from_queue() {
+    // A message pushed into the queue before any client has subscribed must
+    // be delivered to the first client that joins the room. This is the
+    // whole point of the daemon-level backlog: offline clients catch up on
+    // reconnect.
+    let (mut ws, state) = connect_with_state().await;
+    state.queue.lock().unwrap().push(MessageEntry {
+        room: "424242".into(),
+        from: "peer-x".into(),
+        payload: json!({"hi": "there"}),
+        ts: 1234,
+    });
+
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"424242"}}),
+    )
+    .await;
+    let ack = read_json(&mut ws).await;
+    assert_eq!(ack["type"], "ack");
+    let rs = read_json(&mut ws).await;
+    assert_eq!(rs["type"], "room_state");
+    let backlog = read_json(&mut ws).await;
+    assert_eq!(backlog["type"], "message");
+    assert_eq!(backlog["payload"]["room"], "424242");
+    assert_eq!(backlog["payload"]["from"], "peer-x");
+    assert_eq!(backlog["payload"]["payload"]["hi"], "there");
+
+    // Second `join` by the same client must not re-deliver the backlog —
+    // drain left the bucket empty.
+    assert_eq!(state.queue.lock().unwrap().len("424242"), 0);
 }

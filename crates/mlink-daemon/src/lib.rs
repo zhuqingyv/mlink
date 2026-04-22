@@ -12,12 +12,15 @@
 
 pub mod discovery;
 pub mod protocol;
+pub mod queue;
+pub mod rooms;
 pub mod session;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
@@ -26,10 +29,15 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use mlink_core::core::node::{Node, NodeConfig, NodeEvent};
+use mlink_core::core::room::room_hash;
 use mlink_core::protocol::errors::MlinkError;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+
+use crate::protocol::{encode_frame, MessagePayload};
+use crate::queue::{MessageEntry, MessageQueue};
+use crate::rooms::RoomStore;
 
 /// Wire version for the WS protocol envelope. Incremented only on a breaking
 /// change to the frame shape.
@@ -43,12 +51,22 @@ pub const DAEMON_VERSION: &str = "0.1.0";
 /// beyond this the `recv()` yields `Lagged` and we simply skip ahead.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-/// Shared handle to one session's joined-room set. Kept in
-/// `DaemonState::sessions` so the `leave` handler on *other* sessions can
-/// check whether a room is still in use before retiring its hash from the
-/// Node — a naive "always remove" would pull the filter out from under any
-/// other client that still holds the room.
-pub type JoinedRooms = Arc<StdMutex<HashSet<String>>>;
+/// One WS session's subscription state, shared between the session task and
+/// the central fan-out worker. The worker reads `subs` to decide whether to
+/// push a routed message into `tx`; the session task mutates `subs` on
+/// join/leave. `tx` is the session's outbound WS queue — dropping it causes
+/// the worker to prune the entry on next fan-out.
+pub struct SessionEntry {
+    /// Room codes this WS client is currently subscribed to.
+    pub subs: HashSet<String>,
+    /// Outbound text frames destined for this session's WebSocket.
+    pub tx: mpsc::Sender<String>,
+}
+
+/// Shared handle to a session's subscription state. The list in
+/// `DaemonState::sessions` holds one of these per live WS connection; the
+/// pointer is also held by the session task itself for mutation.
+pub type SessionHandle = Arc<StdMutex<SessionEntry>>;
 
 /// State shared across WS connections. `Node` is behind `Arc` so we can clone
 /// the handle into each connection task; `node_events` is the broadcast
@@ -57,7 +75,15 @@ pub type JoinedRooms = Arc<StdMutex<HashSet<String>>>;
 pub struct DaemonState {
     pub node: Arc<Node>,
     pub node_events: broadcast::Sender<NodeEvent>,
-    pub sessions: Arc<StdMutex<Vec<JoinedRooms>>>,
+    pub sessions: Arc<StdMutex<Vec<SessionHandle>>>,
+    /// Persistent room membership. Mutated by WS join/leave so the set
+    /// survives daemon restarts; loaded and auto-joined in `build_state`
+    /// before discovery boots.
+    pub rooms: Arc<StdMutex<RoomStore>>,
+    /// Per-room backlog. Incoming peer messages are appended here before
+    /// being fanned to subscribers, and `join` drains the bucket so a client
+    /// that reconnects doesn't lose messages received while it was gone.
+    pub queue: Arc<StdMutex<MessageQueue>>,
 }
 
 /// Contents of `~/.mlink/daemon.json`. Written on startup, removed on clean
@@ -226,6 +252,99 @@ pub async fn build_state() -> Result<DaemonState, DaemonError> {
         }
     });
 
+    // Restore persisted room membership *before* discovery boots, so peers
+    // advertising those rooms match as soon as the scanner sees them. Missing
+    // or corrupt rooms.json yields an empty store (see rooms::RoomStore::load).
+    let rooms_path = rooms::rooms_file_path()?;
+    let room_store = RoomStore::load(rooms_path);
+    for code in room_store.list() {
+        node.add_room_hash(room_hash(&code));
+    }
+    let rooms = Arc::new(StdMutex::new(room_store));
+    let queue = Arc::new(StdMutex::new(MessageQueue::new()));
+    let sessions: Arc<StdMutex<Vec<SessionHandle>>> = Arc::new(StdMutex::new(Vec::new()));
+
+    // Fan-out worker: consumes MessageReceived, stores one entry per
+    // daemon-level room, and pushes to every session subscribed to that
+    // room. The queue+sessions mutex pair is held across push-then-fan so a
+    // racing `join` either sees the message in the queue (via drain) or
+    // receives it through fan-out, never both, never neither.
+    {
+        let mut events_rx = tx.subscribe();
+        let queue_bg = Arc::clone(&queue);
+        let sessions_bg = Arc::clone(&sessions);
+        let rooms_bg = Arc::clone(&rooms);
+        tokio::spawn(async move {
+            loop {
+                match events_rx.recv().await {
+                    Ok(NodeEvent::MessageReceived { peer_id, payload }) => {
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        // Parse payload into JSON once (fall back to utf-8
+                        // string / binary placeholder) so the queued entry
+                        // is the same shape every subscriber will see.
+                        let value = match std::str::from_utf8(&payload) {
+                            Ok(s) => match serde_json::from_str(s) {
+                                Ok(v) => v,
+                                Err(_) => serde_json::Value::String(s.to_string()),
+                            },
+                            Err(_) => serde_json::Value::String(format!(
+                                "<{} bytes binary>",
+                                payload.len()
+                            )),
+                        };
+                        let daemon_rooms: Vec<String> = rooms_bg
+                            .lock()
+                            .expect("rooms poisoned")
+                            .list();
+                        if daemon_rooms.is_empty() {
+                            continue;
+                        }
+                        // Under one critical section: queue push + subscriber
+                        // fan-out. Drops on a slow session `tx` are tolerated
+                        // because the message is already in the backlog.
+                        let mut q = queue_bg.lock().expect("queue poisoned");
+                        let sessions = sessions_bg.lock().expect("sessions poisoned");
+                        for room_code in &daemon_rooms {
+                            q.push(MessageEntry {
+                                room: room_code.clone(),
+                                from: peer_id.clone(),
+                                payload: value.clone(),
+                                ts,
+                            });
+                            let frame = encode_frame(
+                                "message",
+                                None,
+                                MessagePayload {
+                                    room: room_code,
+                                    from: peer_id.clone(),
+                                    payload: value.clone(),
+                                    ts,
+                                },
+                            );
+                            for session in sessions.iter() {
+                                let (is_sub, tx) = {
+                                    let e = session.lock().expect("session poisoned");
+                                    (e.subs.contains(room_code), e.tx.clone())
+                                };
+                                if is_sub {
+                                    let _ = tx.try_send(frame.clone());
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "fan-out worker lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
     // Kick off discovery + accept in the background so every WS client shares
     // one scanner/peripheral pair. `DaemonTransport::from_env` is permissive —
     // an unknown value silently falls back to TCP (safe default for CI).
@@ -234,7 +353,9 @@ pub async fn build_state() -> Result<DaemonState, DaemonError> {
     Ok(DaemonState {
         node,
         node_events: tx,
-        sessions: Arc::new(StdMutex::new(Vec::new())),
+        sessions,
+        rooms,
+        queue,
     })
 }
 
