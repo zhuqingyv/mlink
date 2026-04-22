@@ -190,7 +190,7 @@ async fn test_node_initial_state() {
 async fn test_node_start_discovering() {
     let _home = set_tmp_home();
     let (cfg, _dir) = tmp_trust_config();
-    let mut node = Node::new(cfg).await.expect("node new");
+    let node = Node::new(cfg).await.expect("node new");
     node.start().await.expect("start");
     assert_eq!(node.state(), NodeState::Discovering);
 
@@ -209,7 +209,7 @@ async fn test_node_start_discovering() {
 async fn test_node_state_transitions() {
     let _home = set_tmp_home();
     let (cfg, _dir) = tmp_trust_config();
-    let mut node = Node::new(cfg).await.expect("node new");
+    let node = Node::new(cfg).await.expect("node new");
 
     // Idle → Discovering
     assert_eq!(node.state(), NodeState::Idle);
@@ -243,7 +243,7 @@ async fn test_node_state_transitions() {
 async fn test_node_stop() {
     let _home = set_tmp_home();
     let (cfg, _dir) = tmp_trust_config();
-    let mut node = Node::new(cfg).await.expect("node new");
+    let node = Node::new(cfg).await.expect("node new");
     node.start().await.expect("start");
     node.stop().await.expect("stop");
     assert_eq!(node.state(), NodeState::Idle);

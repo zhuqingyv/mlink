@@ -133,13 +133,15 @@ async fn build_node() -> Result<Node, MlinkError> {
 /// If `room_code` is set both the peripheral advertisement and the scan filter
 /// are tagged with its hash so the two sides can rendezvous on the same room.
 async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(), MlinkError> {
-    let mut node = build_node().await?;
+    let node = build_node().await?;
     let local_name = node.config().name.clone();
     let room_hash_bytes: Option<[u8; 8]> = room_code.as_deref().map(room_hash);
 
     // Tell the node which room we belong to — the handshake round-trip will
     // drop any peer that claims a different room (or no room, when we have one).
-    node.set_room_hash(room_hash_bytes);
+    if let Some(h) = room_hash_bytes {
+        node.add_room_hash(h);
+    }
 
     node.start().await?;
 
@@ -546,10 +548,10 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
 async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
     validate_room_code(&code)?;
 
-    let mut node = build_node().await?;
+    let node = build_node().await?;
     let local_name = node.config().name.clone();
     let hash = room_hash(&code);
-    node.set_room_hash(Some(hash));
+    node.add_room_hash(hash);
     node.start().await?;
 
     println!("[mlink] chat: room {code}");
@@ -938,9 +940,9 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
 async fn cmd_join(code: String, chat: bool, kind: TransportKind) -> Result<(), MlinkError> {
     validate_room_code(&code)?;
 
-    let mut node = build_node().await?;
+    let node = build_node().await?;
     let hash = room_hash(&code);
-    node.set_room_hash(Some(hash));
+    node.add_room_hash(hash);
     node.start().await?;
 
     println!("[mlink] joining room {code}");
@@ -1244,8 +1246,8 @@ async fn cmd_send_room(
         ));
     }
 
-    let mut node = build_node().await?;
-    node.set_room_hash(Some(room_hash(&code)));
+    let node = build_node().await?;
+    node.add_room_hash(room_hash(&code));
     node.start().await?;
 
     // Scanner owns a transport instance and enforces the room-hash filter so
@@ -1399,7 +1401,7 @@ async fn cmd_connect(peer_id: String, kind: TransportKind) -> Result<(), MlinkEr
         MlinkError::HandlerError(format!("peer {peer_id} not found in scan results"))
     })?;
 
-    let mut node = build_node().await?;
+    let node = build_node().await?;
     node.start().await?;
 
     println!("connecting to {peer_id}...");
@@ -1418,7 +1420,7 @@ async fn cmd_ping(peer_id: String, kind: TransportKind) -> Result<(), MlinkError
         MlinkError::HandlerError(format!("peer {peer_id} not found in scan results"))
     })?;
 
-    let mut node = build_node().await?;
+    let node = build_node().await?;
     node.start().await?;
 
     let app_uuid = node.connect_peer(transport.as_mut(), &discovered).await?;

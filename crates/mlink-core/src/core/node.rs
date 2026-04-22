@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -97,9 +97,9 @@ pub struct Node {
     peer_states: Arc<RwLock<HashMap<String, PeerState>>>,
     connections: Arc<Mutex<ConnectionManager>>,
     trust_store: Arc<RwLock<TrustStore>>,
-    state: NodeState,
+    state: StdMutex<NodeState>,
     events_tx: broadcast::Sender<NodeEvent>,
-    room_hash: Option<[u8; 8]>,
+    room_hashes: StdMutex<HashSet<[u8; 8]>>,
 }
 
 impl Node {
@@ -119,26 +119,42 @@ impl Node {
             peer_states: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(Mutex::new(ConnectionManager::new())),
             trust_store: Arc::new(RwLock::new(trust_store)),
-            state: NodeState::Idle,
+            state: StdMutex::new(NodeState::Idle),
             events_tx,
-            room_hash: None,
+            room_hashes: StdMutex::new(HashSet::new()),
         })
     }
 
-    /// Attach a room hash to this node. After connecting, the peer's handshake
-    /// is compared against this value; on mismatch the connection is closed
-    /// and `connect_peer` returns `RoomMismatch`. Pass `None` (default) to
-    /// accept any room.
-    pub fn set_room_hash(&mut self, hash: Option<[u8; 8]>) {
-        self.room_hash = hash;
+    /// Add a room hash to this node's membership set. The handshake will accept
+    /// any peer whose advertised `room_hash` is present in this set. An empty
+    /// set imposes no room restriction.
+    pub fn add_room_hash(&self, hash: [u8; 8]) {
+        self.room_hashes.lock().expect("room_hashes poisoned").insert(hash);
     }
 
-    pub fn room_hash(&self) -> Option<[u8; 8]> {
-        self.room_hash
+    /// Remove a room hash from this node's membership set.
+    pub fn remove_room_hash(&self, hash: &[u8; 8]) {
+        self.room_hashes.lock().expect("room_hashes poisoned").remove(hash);
+    }
+
+    pub fn room_hashes(&self) -> HashSet<[u8; 8]> {
+        self.room_hashes.lock().expect("room_hashes poisoned").clone()
+    }
+
+    /// First room hash we'll advertise on the wire. The Handshake protocol
+    /// still carries a single `Option<[u8;8]>`, so when we belong to multiple
+    /// rooms we just pick one — the peer will verify it against *its* set.
+    fn wire_room_hash(&self) -> Option<[u8; 8]> {
+        self.room_hashes
+            .lock()
+            .expect("room_hashes poisoned")
+            .iter()
+            .next()
+            .copied()
     }
 
     pub fn state(&self) -> NodeState {
-        self.state
+        *self.state.lock().expect("state poisoned")
     }
 
     pub fn app_uuid(&self) -> &str {
@@ -153,18 +169,19 @@ impl Node {
         self.events_tx.subscribe()
     }
 
-    pub async fn start(&mut self) -> Result<()> {
-        if self.state != NodeState::Idle {
+    pub async fn start(&self) -> Result<()> {
+        let mut st = self.state.lock().expect("state poisoned");
+        if *st != NodeState::Idle {
             return Err(MlinkError::HandlerError(format!(
                 "cannot start from state {:?}",
-                self.state
+                *st
             )));
         }
-        self.state = NodeState::Discovering;
+        *st = NodeState::Discovering;
         Ok(())
     }
 
-    pub async fn stop(&mut self) -> Result<()> {
+    pub async fn stop(&self) -> Result<()> {
         let ids: Vec<String> = {
             let guard = self.connections.lock().await;
             guard.list_ids()
@@ -172,7 +189,7 @@ impl Node {
         for id in ids {
             let _ = self.disconnect_peer(&id).await;
         }
-        self.state = NodeState::Idle;
+        *self.state.lock().expect("state poisoned") = NodeState::Idle;
         Ok(())
     }
 
@@ -198,7 +215,7 @@ impl Node {
     }
 
     pub async fn connect_peer(
-        &mut self,
+        &self,
         transport: &mut dyn Transport,
         discovered: &DiscoveredPeer,
     ) -> Result<String> {
@@ -220,6 +237,7 @@ impl Node {
         })?;
         eprintln!("[mlink:conn] node.connect_peer transport.connect OK peer={}", discovered.id);
 
+        let wire_room = self.wire_room_hash();
         let local_hs = Handshake {
             app_uuid: self.app_uuid.clone(),
             version: PROTOCOL_VERSION,
@@ -232,12 +250,12 @@ impl Node {
             encrypt: false,
             last_seq: 0,
             resume_streams: vec![],
-            room_hash: self.room_hash,
+            room_hash: wire_room,
         };
 
         eprintln!(
-            "[mlink:conn] node.connect_peer -> perform_handshake peer={} room_hash={:?}",
-            discovered.id, self.room_hash
+            "[mlink:conn] node.connect_peer -> perform_handshake peer={} wire_room_hash={:?}",
+            discovered.id, wire_room
         );
         let peer_hs = match perform_handshake(conn.as_mut(), &local_hs).await {
             Ok(hs) => {
@@ -257,26 +275,31 @@ impl Node {
             }
         };
 
-        // Room membership check: if we care about a specific room, the peer
-        // must advertise the same hash. Close and bail on mismatch so we
-        // don't surface a peer from a foreign room.
-        if let Some(local) = self.room_hash {
-            match peer_hs.room_hash {
-                Some(peer) if peer == local => {
-                    eprintln!(
-                        "[mlink:conn] node.connect_peer room match OK peer={}",
-                        discovered.id
-                    );
-                }
-                other => {
-                    eprintln!(
-                        "[mlink:conn] node.connect_peer ROOM MISMATCH peer={} local={:?} peer_claims={:?}",
-                        discovered.id, local, other
-                    );
-                    let _ = conn.close().await;
-                    return Err(MlinkError::RoomMismatch {
-                        peer_id: discovered.id.clone(),
-                    });
+        // Room membership check: if we advertise any rooms, the peer's claimed
+        // room_hash must be in our set. Empty set = accept anyone. This lets a
+        // single Node belong to several rooms at once — we just need *some*
+        // overlap between our membership and the peer's claim.
+        {
+            let rooms = self.room_hashes.lock().expect("room_hashes poisoned");
+            if !rooms.is_empty() {
+                match peer_hs.room_hash {
+                    Some(peer) if rooms.contains(&peer) => {
+                        eprintln!(
+                            "[mlink:conn] node.connect_peer room match OK peer={} room={:?}",
+                            discovered.id, peer
+                        );
+                    }
+                    other => {
+                        eprintln!(
+                            "[mlink:conn] node.connect_peer ROOM MISMATCH peer={} local_rooms={:?} peer_claims={:?}",
+                            discovered.id, *rooms, other
+                        );
+                        drop(rooms);
+                        let _ = conn.close().await;
+                        return Err(MlinkError::RoomMismatch {
+                            peer_id: discovered.id.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -321,7 +344,7 @@ impl Node {
             entry.last_heartbeat = Some(Instant::now());
         }
 
-        self.state = NodeState::Connected;
+        *self.state.lock().expect("state poisoned") = NodeState::Connected;
         let _ = self.events_tx.send(NodeEvent::PeerConnected {
             peer_id: peer_id.clone(),
         });
@@ -334,7 +357,7 @@ impl Node {
     /// success — registers the connection under the peer's app_uuid. On
     /// failure the connection is closed so callers don't need to clean up.
     pub async fn accept_incoming(
-        &mut self,
+        &self,
         mut conn: Box<dyn Connection>,
         transport_id: &str,
         fallback_name: String,
@@ -343,6 +366,7 @@ impl Node {
         eprintln!(
             "[mlink:conn] node.accept_incoming ENTER wire_id={wire_id} transport={transport_id}"
         );
+        let wire_room = self.wire_room_hash();
         let local_hs = Handshake {
             app_uuid: self.app_uuid.clone(),
             version: PROTOCOL_VERSION,
@@ -351,12 +375,12 @@ impl Node {
             encrypt: false,
             last_seq: 0,
             resume_streams: vec![],
-            room_hash: self.room_hash,
+            room_hash: wire_room,
         };
 
         eprintln!(
-            "[mlink:conn] node.accept_incoming -> perform_handshake wire={wire_id} room_hash={:?}",
-            self.room_hash
+            "[mlink:conn] node.accept_incoming -> perform_handshake wire={wire_id} wire_room_hash={:?}",
+            wire_room
         );
         let peer_hs = match perform_handshake(conn.as_mut(), &local_hs).await {
             Ok(hs) => {
@@ -375,23 +399,28 @@ impl Node {
             }
         };
 
-        if let Some(local) = self.room_hash {
-            match peer_hs.room_hash {
-                Some(peer) if peer == local => {
-                    eprintln!(
-                        "[mlink:conn] node.accept_incoming room match OK wire={wire_id}"
-                    );
-                }
-                other => {
-                    eprintln!(
-                        "[mlink:conn] node.accept_incoming ROOM MISMATCH wire={wire_id} local={:?} peer_claims={:?}",
-                        local, other
-                    );
-                    let wire_peer_id = conn.peer_id().to_string();
-                    let _ = conn.close().await;
-                    return Err(MlinkError::RoomMismatch {
-                        peer_id: wire_peer_id,
-                    });
+        {
+            let rooms = self.room_hashes.lock().expect("room_hashes poisoned");
+            if !rooms.is_empty() {
+                match peer_hs.room_hash {
+                    Some(peer) if rooms.contains(&peer) => {
+                        eprintln!(
+                            "[mlink:conn] node.accept_incoming room match OK wire={wire_id} room={:?}",
+                            peer
+                        );
+                    }
+                    other => {
+                        eprintln!(
+                            "[mlink:conn] node.accept_incoming ROOM MISMATCH wire={wire_id} local_rooms={:?} peer_claims={:?}",
+                            *rooms, other
+                        );
+                        drop(rooms);
+                        let wire_peer_id = conn.peer_id().to_string();
+                        let _ = conn.close().await;
+                        return Err(MlinkError::RoomMismatch {
+                            peer_id: wire_peer_id,
+                        });
+                    }
                 }
             }
         }
@@ -433,7 +462,7 @@ impl Node {
             entry.state = NodeState::Connected;
             entry.last_heartbeat = Some(Instant::now());
         }
-        self.state = NodeState::Connected;
+        *self.state.lock().expect("state poisoned") = NodeState::Connected;
         let _ = self.events_tx.send(NodeEvent::PeerConnected {
             peer_id: peer_id.clone(),
         });
@@ -446,7 +475,7 @@ impl Node {
     ///
     /// Production code paths should use `connect_peer` instead, which performs
     /// the handshake and wires up the full PeerState.
-    pub async fn attach_connection(&mut self, peer_id: String, conn: Box<dyn Connection>) {
+    pub async fn attach_connection(&self, peer_id: String, conn: Box<dyn Connection>) {
         {
             let mut guard = self.connections.lock().await;
             guard.add(peer_id.clone(), conn).await;
@@ -457,11 +486,11 @@ impl Node {
             entry.state = NodeState::Connected;
             entry.last_heartbeat = Some(Instant::now());
         }
-        self.state = NodeState::Connected;
+        *self.state.lock().expect("state poisoned") = NodeState::Connected;
         let _ = self.events_tx.send(NodeEvent::PeerConnected { peer_id });
     }
 
-    pub async fn disconnect_peer(&mut self, peer_id: &str) -> Result<()> {
+    pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
         let removed = {
             let mut guard = self.connections.lock().await;
             guard.remove(peer_id).await
@@ -799,7 +828,7 @@ mod tests {
     async fn start_transitions_to_discovering() {
         let _tmp = set_tmp_home();
         let tmp2 = tempfile::tempdir().expect("tmp2");
-        let mut node = Node::new(tmp_config(tmp2.path().join("t.json")))
+        let node = Node::new(tmp_config(tmp2.path().join("t.json")))
             .await
             .expect("new");
         node.start().await.expect("start");
@@ -810,7 +839,7 @@ mod tests {
     async fn start_rejects_double_start() {
         let _tmp = set_tmp_home();
         let tmp2 = tempfile::tempdir().expect("tmp2");
-        let mut node = Node::new(tmp_config(tmp2.path().join("t.json")))
+        let node = Node::new(tmp_config(tmp2.path().join("t.json")))
             .await
             .expect("new");
         node.start().await.expect("start 1");
@@ -822,7 +851,7 @@ mod tests {
     async fn stop_returns_to_idle() {
         let _tmp = set_tmp_home();
         let tmp2 = tempfile::tempdir().expect("tmp2");
-        let mut node = Node::new(tmp_config(tmp2.path().join("t.json")))
+        let node = Node::new(tmp_config(tmp2.path().join("t.json")))
             .await
             .expect("new");
         node.start().await.expect("start");
@@ -862,7 +891,7 @@ mod tests {
     async fn connect_peer_via_mock_transport_errors_cleanly() {
         let _tmp = set_tmp_home();
         let tmp2 = tempfile::tempdir().expect("tmp2");
-        let mut node = Node::new(tmp_config(tmp2.path().join("t.json")))
+        let node = Node::new(tmp_config(tmp2.path().join("t.json")))
             .await
             .expect("new");
         let mut transport = MockTransport::new();
@@ -913,15 +942,15 @@ mod tests {
         let _tmp = set_tmp_home();
         let tmp_a = tempfile::tempdir().expect("tmp-a");
         let tmp_b = tempfile::tempdir().expect("tmp-b");
-        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+        let node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
             .await
             .expect("new a");
-        let mut node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+        let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
             .await
             .expect("new b");
         let room = [0x55u8; 8];
-        node_a.set_room_hash(Some(room));
-        node_b.set_room_hash(Some(room));
+        node_a.add_room_hash(room);
+        node_b.add_room_hash(room);
 
         let (ca, cb) = crate::transport::mock::mock_pair();
         // Both sides run the handshake concurrently: one side acts as the
@@ -957,13 +986,13 @@ mod tests {
         let _tmp = set_tmp_home();
         let tmp_a = tempfile::tempdir().expect("tmp-a");
         let tmp_b = tempfile::tempdir().expect("tmp-b");
-        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+        let node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
             .await
             .expect("new a");
         let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
             .await
             .expect("new b");
-        node_a.set_room_hash(Some([0x11; 8]));
+        node_a.add_room_hash([0x11; 8]);
         let bogus_room = Some([0x22u8; 8]);
 
         let (ca, cb) = crate::transport::mock::mock_pair();
@@ -995,24 +1024,112 @@ mod tests {
 
     #[tokio::test]
     async fn connect_peer_matching_room_roundtrip_is_accepted() {
-        // Covered via the protocol: ensure set_room_hash round-trips.
+        // Round-trip: add / remove a room and observe the membership set.
         let _tmp = set_tmp_home();
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut node = Node::new(tmp_config(tmp.path().join("t.json")))
+        let node = Node::new(tmp_config(tmp.path().join("t.json")))
             .await
             .expect("new");
-        assert!(node.room_hash().is_none());
-        node.set_room_hash(Some([0xFE; 8]));
-        assert_eq!(node.room_hash(), Some([0xFE; 8]));
-        node.set_room_hash(None);
-        assert!(node.room_hash().is_none());
+        assert!(node.room_hashes().is_empty());
+        node.add_room_hash([0xFE; 8]);
+        assert!(node.room_hashes().contains(&[0xFE; 8]));
+        node.remove_room_hash(&[0xFE; 8]);
+        assert!(node.room_hashes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn node_in_multiple_rooms_accepts_peers_from_any_of_them() {
+        // A node that belongs to {room_a, room_b} must accept a peer whose
+        // handshake advertises room_b — it's in the set. Previously the Node
+        // only tracked one room_hash, so this scenario could not be expressed.
+        let _tmp = set_tmp_home();
+        let tmp_a = tempfile::tempdir().expect("tmp-a");
+        let tmp_b = tempfile::tempdir().expect("tmp-b");
+        let node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+            .await
+            .expect("new a");
+        let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+            .await
+            .expect("new b");
+        let room_a = [0xAAu8; 8];
+        let room_b = [0xBBu8; 8];
+        // node_a is a member of both rooms; node_b is only in room_b.
+        node_a.add_room_hash(room_a);
+        node_a.add_room_hash(room_b);
+        node_b.add_room_hash(room_b);
+        assert_eq!(node_a.room_hashes().len(), 2);
+
+        let (ca, cb) = crate::transport::mock::mock_pair();
+        let hs_b = Handshake {
+            app_uuid: node_b.app_uuid().to_string(),
+            version: PROTOCOL_VERSION,
+            mtu: 512,
+            compress: true,
+            encrypt: false,
+            last_seq: 0,
+            resume_streams: vec![],
+            room_hash: Some(room_b),
+        };
+        let driver = tokio::spawn(async move {
+            let mut cb: Box<dyn Connection> = Box::new(cb);
+            perform_handshake(cb.as_mut(), &hs_b).await.expect("peer hs");
+        });
+
+        let got = node_a
+            .accept_incoming(Box::new(ca), "mock", "mock-peer".into())
+            .await
+            .expect("accept ok — room_b is in node_a's set");
+        driver.await.expect("driver joined");
+        assert_eq!(got, node_b.app_uuid());
+        assert_eq!(node_a.connection_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn node_rejects_peer_whose_room_is_not_in_set() {
+        // Negative case for multi-room membership: node belongs to {A, B};
+        // peer claims room C — rejection must still fire.
+        let _tmp = set_tmp_home();
+        let tmp_a = tempfile::tempdir().expect("tmp-a");
+        let tmp_b = tempfile::tempdir().expect("tmp-b");
+        let node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+            .await
+            .expect("new a");
+        let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+            .await
+            .expect("new b");
+        node_a.add_room_hash([0xAA; 8]);
+        node_a.add_room_hash([0xBB; 8]);
+
+        let (ca, cb) = crate::transport::mock::mock_pair();
+        let hs_b = Handshake {
+            app_uuid: node_b.app_uuid().to_string(),
+            version: PROTOCOL_VERSION,
+            mtu: 512,
+            compress: true,
+            encrypt: false,
+            last_seq: 0,
+            resume_streams: vec![],
+            room_hash: Some([0xCC; 8]),
+        };
+        let driver = tokio::spawn(async move {
+            let mut cb: Box<dyn Connection> = Box::new(cb);
+            let _ = perform_handshake(cb.as_mut(), &hs_b).await;
+        });
+
+        let err = node_a
+            .accept_incoming(Box::new(ca), "mock", "mock-peer".into())
+            .await
+            .unwrap_err();
+        let _ = driver.await;
+        assert!(matches!(err, MlinkError::RoomMismatch { .. }));
+        assert_eq!(node_a.connection_count().await, 0);
     }
 
     #[tokio::test]
     async fn attach_connection_enables_send_recv_without_handshake() {
         let _tmp = set_tmp_home();
         let tmp2 = tempfile::tempdir().expect("tmp2");
-        let mut node = Node::new(tmp_config(tmp2.path().join("t.json")))
+        let node = Node::new(tmp_config(tmp2.path().join("t.json")))
             .await
             .expect("new");
 
@@ -1047,7 +1164,7 @@ mod tests {
         let _tmp = set_tmp_home();
         let tmp_a = tempfile::tempdir().expect("tmp-a");
         let tmp_b = tempfile::tempdir().expect("tmp-b");
-        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+        let node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
             .await
             .expect("new a");
         let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
@@ -1096,7 +1213,7 @@ mod tests {
     async fn has_peer_tracks_attach_and_disconnect() {
         let _tmp = set_tmp_home();
         let tmp = tempfile::tempdir().expect("tmp");
-        let mut node = Node::new(tmp_config(tmp.path().join("t.json")))
+        let node = Node::new(tmp_config(tmp.path().join("t.json")))
             .await
             .expect("new");
         assert!(!node.has_peer("peer-x").await);
@@ -1115,10 +1232,10 @@ mod tests {
         let _tmp = set_tmp_home();
         let tmp_a = tempfile::tempdir().expect("tmp-a");
         let tmp_b = tempfile::tempdir().expect("tmp-b");
-        let mut node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
+        let node_a = Node::new(tmp_config(tmp_a.path().join("a.json")))
             .await
             .expect("new a");
-        let mut node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
+        let node_b = Node::new(tmp_config(tmp_b.path().join("b.json")))
             .await
             .expect("new b");
 

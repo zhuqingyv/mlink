@@ -549,7 +549,7 @@ async fn make_node(encrypt: bool) -> (Node, tempfile::TempDir) {
 async fn test_node_attach_and_send_raw() {
     // Attach one mock endpoint to a Node, drive the other endpoint directly,
     // observe that send_raw produces a wire-format frame the peer can decode.
-    let (mut node, _tmp) = make_node(false).await;
+    let (node, _tmp) = make_node(false).await;
     let (local, mut remote) = mock_pair();
     node.attach_connection("peer-x".into(), Box::new(local)).await;
 
@@ -571,7 +571,7 @@ async fn test_node_attach_and_send_raw() {
 #[tokio::test]
 async fn test_node_recv_raw_over_mock() {
     // Inverse direction: remote writes a valid frame, Node::recv_raw yields it.
-    let (mut node, _tmp) = make_node(false).await;
+    let (node, _tmp) = make_node(false).await;
     let (local, mut remote) = mock_pair();
     node.attach_connection("peer-y".into(), Box::new(local)).await;
 
@@ -594,8 +594,8 @@ async fn test_node_bidirectional_attached() {
     // build both nodes back-to-back while holding the HOME lock — after
     // Node::new returns, HOME can change and the node keeps working (uuid
     // was already loaded into the struct).
-    let (mut node_a, _ta) = make_node(false).await;
-    let (mut node_b, _tb) = make_node(false).await;
+    let (node_a, _ta) = make_node(false).await;
+    let (node_b, _tb) = make_node(false).await;
 
     let (ca, cb) = mock_pair();
     node_a.attach_connection("peer-b-from-a".into(), Box::new(ca)).await;
@@ -620,10 +620,10 @@ async fn test_node_isolated_pairs() {
     // (nodes X↔Y on pair 1, nodes U↔V on pair 2). A message sent on pair 1
     // must not leak into pair 2 — since the channels are physically disjoint
     // this would only fail if a Node globally multicast send_raw (it doesn't).
-    let (mut node_x, _tx) = make_node(false).await;
-    let (mut node_y, _ty) = make_node(false).await;
-    let (mut node_u, _tu) = make_node(false).await;
-    let (mut node_v, _tv) = make_node(false).await;
+    let (node_x, _tx) = make_node(false).await;
+    let (node_y, _ty) = make_node(false).await;
+    let (node_u, _tu) = make_node(false).await;
+    let (node_v, _tv) = make_node(false).await;
 
     let (cx, cy) = mock_pair();
     let (cu, cv) = mock_pair();
@@ -661,7 +661,7 @@ async fn test_node_send_raw_missing_peer() {
 
 #[tokio::test]
 async fn test_node_disconnect_removes_connection() {
-    let (mut node, _t) = make_node(false).await;
+    let (node, _t) = make_node(false).await;
     let (local, _remote) = mock_pair();
     node.attach_connection("pz".into(), Box::new(local)).await;
     assert_eq!(node.connection_count().await, 1);
@@ -674,8 +674,8 @@ async fn test_node_disconnect_removes_connection() {
 async fn test_node_encrypted_send_recv() {
     // Encryption path: matching AES key on both sides → Node.send_raw produces
     // an encrypted frame that the receiving Node decrypts transparently.
-    let (mut node_a, _ta) = make_node(true).await;
-    let (mut node_b, _tb) = make_node(true).await;
+    let (node_a, _ta) = make_node(true).await;
+    let (node_b, _tb) = make_node(true).await;
 
     let (ca, cb) = mock_pair();
     node_a.attach_connection("b".into(), Box::new(ca)).await;
@@ -701,8 +701,8 @@ async fn test_node_rpc_end_to_end_attached() {
     // send_request / send_response / dispatch_request helpers.
     use mlink_core::api::rpc::{dispatch_request, rpc_request};
 
-    let (mut node_a, _ta) = make_node(false).await;
-    let (mut node_b, _tb) = make_node(false).await;
+    let (node_a, _ta) = make_node(false).await;
+    let (node_b, _tb) = make_node(false).await;
 
     let (ca, cb) = mock_pair();
     node_a.attach_connection("b".into(), Box::new(ca)).await;
@@ -765,8 +765,8 @@ async fn test_node_rpc_end_to_end_attached() {
 async fn test_node_heartbeat_roundtrip() {
     // send_heartbeat produces a Heartbeat-typed frame; when the peer decodes
     // it, recv_raw bumps last_heartbeat. check_heartbeat returns true.
-    let (mut node_a, _ta) = make_node(false).await;
-    let (mut node_b, _tb) = make_node(false).await;
+    let (node_a, _ta) = make_node(false).await;
+    let (node_b, _tb) = make_node(false).await;
 
     let (ca, cb) = mock_pair();
     node_a.attach_connection("b".into(), Box::new(ca)).await;
