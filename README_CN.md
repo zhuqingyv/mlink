@@ -2,114 +2,86 @@
 
 # mlink
 
-> 面向设备的本地优先通信基础设施。
+> 面向本地设备的通信运行时（local-first device communication runtime）。
 
-mlink 是同一个 room 内设备之间的"哑管道"。任意两台设备——无论走 Bluetooth、LAN 还是 IPC——都能绕开公网，可靠地交换字节。
+## mlink 是什么？
 
-## 愿景
+mlink 是一个运行时，负责在你的设备之间搬运字节，全程不经过公网。上层应用——agent、知识库、同步工具——通过 WebSocket 连到本机的 mlink daemon，由 daemon 走 BLE 或局域网把消息送到对端。mlink 只做一件事：送字节，是条哑管道。
 
-mlink 面向开发者，提供一个传输原语。上层应用（比如 [mteam](https://github.com/zhuqingyv/mteam)）通过本地 HTTP API 跟 mlink 对话，完全不用关心底下跑的是 BLE 还是 TCP。mlink 只做一件事：把字节端到端地送到。
-
-## 业务模型
+## 架构
 
 ```
-            Room "567892"  (6-digit code, shared across devices)
-    ┌─────────────────────────────────────────────────────────┐
-    │                                                         │
-    │   ┌────────┐          ┌────────┐          ┌────────┐    │
-    │   │ Node A │ ◄──────► │ Node B │ ◄──────► │ Node C │    │
-    │   │ uuid=a │          │ uuid=b │          │ uuid=c │    │
-    │   └────────┘          └────────┘          └────────┘    │
-    │        ▲                   ▲                   ▲        │
-    │        └───────────────────┴───────────────────┘        │
-    │                   full-mesh inside room                 │
-    │                                                         │
-    └─────────────────────────────────────────────────────────┘
-              Transport auto-selected: BLE / TCP / IPC
+ ┌──────────┐   WebSocket    ┌──────────────┐    BLE / TCP    ┌──────────────┐   WebSocket    ┌──────────┐
+ │ 你的应用 │ ◄────────────► │ mlink daemon │ ◄─────────────► │ mlink daemon │ ◄────────────► │ 对端应用 │
+ │          │  ws://127.0.0  │  (设备 A)    │                 │   (设备 B)   │                │          │
+ └──────────┘   .0.1:<port>  └──────────────┘                 └──────────────┘                └──────────┘
 ```
 
-- **Room** —— 6 位数字码。输入同一个码的设备加入同一个 room。
-- **Node** —— 每台设备一个，用稳定的 `app_uuid` 标识。
-- **Mesh** —— 同一个 room 内所有 node 两两互通。
-- **Transport** —— BLE、TCP+mDNS、IPC，根据环境自动选择。
+你的应用不碰蓝牙、socket、mDNS。它只通过本机 WebSocket 发 JSON，下面的事全由 mlink 处理。
 
-## 架构分层
+## 核心概念
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Application Layer                                           │
-│  HTTP API on localhost  (mteam, other apps)      [planned]   │
-├──────────────────────────────────────────────────────────────┤
-│  API Layer                                                   │
-│  message  │  rpc  │  stream  │  pubsub                       │
-├──────────────────────────────────────────────────────────────┤
-│  Core Layer                                                  │
-│  Node  │  Room  │  Scanner  │  Connection  │  Peer           │
-├──────────────────────────────────────────────────────────────┤
-│  Protocol Layer                                              │
-│  Frame codec  │  zstd  │  AES-GCM  │  MessagePack            │
-├──────────────────────────────────────────────────────────────┤
-│  Transport Layer                                             │
-│  BLE          │  TCP + mDNS     │  IPC                       │
-└──────────────────────────────────────────────────────────────┘
-```
+- **Room（房间）** —— 6 位数字码。输入同一个码的设备就在同一个房间。房间内所有设备两两互通（full mesh）。
+- **Transport（传输通道）** —— BLE（无网络即可）或 TCP + mDNS（同局域网），自动选择，无需配置。
+- **WebSocket API** —— 每台设备一个本地 daemon。任何支持 WebSocket 的语言都能接入；单条连接可同时订阅多个房间。
+- **哑管道** —— mlink 不解析、不持久化、不解释你的 payload。业务语义归上层。
 
-## 数据流
+## WebSocket 协议（v1）
 
-一条消息从设备 1 的 App A 发往设备 2 的 App B：
+所有消息都是 JSON 对象，统一信封：`{ "v": 1, "type": "...", "payload": {...} }`。请求可带客户端生成的 `id`，对应响应会原样回传。
 
-```
-  App A                                                 App B
-    │                                                     ▲
-    │ POST /send {room, payload}                          │ SSE /events
-    ▼                                                     │
-┌─────────┐                                         ┌─────────┐
-│ mlink 1 │                                         │ mlink 2 │
-└─────────┘                                         └─────────┘
-    │                                                     ▲
-    │  MessagePack ─► zstd ─► AES ─► Frame                │
-    ▼                                                     │
-  Transport (BLE / TCP / IPC) ──────────────────────►  Transport
-                                                          │
-                                      Frame ─► AES ─► zstd ─► MessagePack
-```
+### 客户端 → daemon（5 种）
+
+| type     | payload                                 | 用途                                                 |
+|----------|-----------------------------------------|------------------------------------------------------|
+| `hello`  | `{ client_name, client_version }`       | 握手，新连接的第一条消息。                          |
+| `join`   | `{ room }`                              | 订阅房间，可多次调用订阅多个房间。                  |
+| `leave`  | `{ room }`                              | 退订房间。                                           |
+| `send`   | `{ room, payload, to? }`                | 房间广播；带 `to`（peer 的 app_uuid）即为点对点。  |
+| `ping`   | `{}`                                    | 应用层心跳。                                         |
+
+### daemon → 客户端（6 种）
+
+| type          | payload                                     | 触发时机                                        |
+|---------------|---------------------------------------------|-------------------------------------------------|
+| `ready`       | `{ app_uuid, version, caps[] }`             | `hello` 的响应，告诉你这个 daemon 是谁。       |
+| `ack`         | `{ id, op }`                                | 确认带 `id` 的请求已受理。                     |
+| `error`       | `{ id?, code, message }`                    | 请求失败或运行时错误。                          |
+| `room_state`  | `{ room, peers[], joined }`                 | 房间成员变化（join / leave / peer 进出）。    |
+| `message`     | `{ room, from, payload, ts }`               | 订阅房间内的 peer 发来消息。                   |
+| `pong`        | `{}`                                        | `ping` 的响应。                                 |
 
 ## 快速上手
 
-两台设备，命令对称。
-
 ```bash
-# Mac A —— 创建 room
-mlink 567892
-
-# Mac B —— 加入 room
-mlink join 567892
+# 每台设备起一个 daemon
+mlink daemon
 ```
 
-聊天模式：
+然后在任意语言里用 WebSocket 客户端接入：
 
-```bash
-# Mac A
-mlink chat 567892
-
-# Mac B
-mlink join --chat 567892
+```js
+const ws = new WebSocket("ws://127.0.0.1:7421/ws")
+ws.onopen = () => {
+  ws.send(JSON.stringify({ v: 1, type: "hello", payload: { client_name: "my-app", client_version: "0.1" } }))
+  ws.send(JSON.stringify({ v: 1, type: "join",  payload: { room: "567892" } }))
+}
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data)
+  if (msg.type === "message") console.log(msg.from, msg.payload)
+}
+ws.send(JSON.stringify({ v: 1, type: "send", payload: { room: "567892", payload: { text: "hi" } } }))
 ```
 
-TCP 模式（同一局域网）：
-
-```bash
-mlink --transport tcp chat 567892
-```
+其它加入 `567892` 的设备会在各自的 daemon 上收到这条消息。
 
 ## 传输通道支持
 
-| Transport  | 适用场景                 | 状态     |
-|------------|--------------------------|----------|
-| BLE        | 无网络、近距离           | 稳定     |
-| TCP + mDNS | 同一局域网               | 稳定     |
-| IPC        | 同一主机、跨进程         | 稳定     |
-| QUIC       | 跨网络                   | 规划中   |
+| Transport   | 适用场景               | 状态   |
+|-------------|------------------------|--------|
+| BLE         | 无网络，近距离         | 稳定   |
+| TCP + mDNS  | 同一局域网             | 稳定   |
+| QUIC        | 跨网络                 | 规划中 |
 
 ## 安装
 
@@ -121,41 +93,12 @@ curl -fsSL https://raw.githubusercontent.com/zhuqingyv/mlink/main/install.sh | s
 cargo install --path crates/mlink-cli
 ```
 
-## HTTP API（规划中）
-
-启动后，mlink 在 `localhost` 上暴露一套本地 REST API：
-
-- `POST /room/create` —— 创建一个 room
-- `POST /room/join` —— 加入已有的 room
-- `POST /send` —— 向 room 发送一条消息
-- `GET  /peers` —— 列出已连接的 peer
-- `GET  /events` —— SSE 流，推送接收到的消息
-
-## 特性
-
-- **零配置** —— peer 之间自动发现。
-- **多通道并行** —— BLE 和 TCP 同时跑，哪条先通用哪条。
-- **哑管道** —— 只管送达，不掺业务语义。
-- **Room 隔离** —— 不同 room 之间流量互不可见。
-- **压缩** —— zstd 透明处理。
-- **加密** —— AES-GCM（加固中）。
-
-## 集成方式
-
-把 mlink 集成进应用的步骤：
-
-1. 启动 mlink 本地服务（独立二进制或以 sidecar 形式）。
-2. 通过 `POST /room/join` 加入一个 room。
-3. 用 `POST /send` 发消息，用 `GET /events`（SSE）收消息。
-
-上层应用完全不用碰 BLE、mDNS 或 socket 代码。
-
-## 不做的事
+## mlink 不做的事
 
 - 不向公网转发。
-- 不处理业务逻辑。
-- 不做账号和身份管理。
-- 不做消息持久化。
+- 不做业务逻辑，payload 含义归你自己定义。
+- 除了"本机进程"这层信任边界，不做账号、身份、鉴权。
+- 不做消息持久化或离线队列。
 
 ## License
 
