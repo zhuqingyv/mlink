@@ -368,6 +368,167 @@ async fn explicit_leave_without_other_subscribers_retires_room() {
     assert!(!listed.iter().any(|c| c == "272727"));
 }
 
+/// Drive `accept_incoming` on the daemon's Node against a mock connection.
+/// Returns once the Node has registered the peer — i.e. PeerManager now holds
+/// an entry and a `PeerConnected` event has been broadcast. Uses the same
+/// in-crate handshake driver pattern as `node.rs` integration tests.
+///
+/// The peer's advertised `room_hash` is picked from the daemon's current set
+/// (or `None` if the daemon hasn't joined any room yet), so the handshake
+/// passes the room-intersection check regardless of when the caller joined.
+async fn attach_handshaked_peer(state: &DaemonState) -> String {
+    use mlink_core::core::connection::perform_handshake;
+    use mlink_core::core::peer::generate_app_uuid;
+    use mlink_core::protocol::types::{Handshake, PROTOCOL_VERSION};
+    use mlink_core::transport::mock::mock_pair;
+
+    let (ca, cb) = mock_pair();
+    let peer_app_uuid = generate_app_uuid();
+    let room_hash = state.node.room_hashes().into_iter().next();
+    let hs = Handshake {
+        app_uuid: peer_app_uuid.clone(),
+        version: PROTOCOL_VERSION,
+        mtu: 512,
+        compress: true,
+        encrypt: false,
+        last_seq: 0,
+        resume_streams: vec![],
+        room_hash,
+    };
+    let driver = tokio::spawn(async move {
+        let _ = perform_handshake(&cb, &hs).await;
+    });
+    let id = state
+        .node
+        .accept_incoming(Box::new(ca), "mock", "mock-peer".into())
+        .await
+        .expect("accept_incoming");
+    driver.await.expect("driver joined");
+    assert_eq!(id, peer_app_uuid);
+    peer_app_uuid
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_returns_connected_peers_in_room_state() {
+    // Once a real peer has handshaked through `accept_incoming`, a fresh
+    // `join` must surface that peer in the returned `room_state.peers` list.
+    // Regression: previously this was always `[]` because session.rs never
+    // consulted `node.peers()` on the event-driven path.
+    //
+    // multi_thread runtime is required because accept_incoming drives its
+    // handshake via a spawned driver; running everything on one thread plus
+    // axum::serve + session loops tends to starve one of them under test load.
+    let (mut ws, state) = connect_with_state().await;
+    let peer_app_uuid = attach_handshaked_peer(&state).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"515151"}}),
+    )
+    .await;
+    let ack = read_json(&mut ws).await;
+    assert_eq!(ack["type"], "ack");
+
+    // PeerConnected may race ahead of our join — read frames until we find a
+    // room_state for this room, then assert its peer list.
+    let mut peers_found: Option<usize> = None;
+    for _ in 0..6 {
+        let frame = read_json(&mut ws).await;
+        if frame["type"] != "room_state" {
+            continue;
+        }
+        if frame["payload"]["room"] == "515151" {
+            peers_found = Some(frame["payload"]["peers"].as_array().unwrap().len());
+            break;
+        }
+    }
+    assert_eq!(
+        peers_found.unwrap_or(0),
+        1,
+        "expected the handshaked peer ({}) to appear in peers list",
+        peer_app_uuid
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_connected_event_pushes_room_state_with_peers() {
+    // PeerConnected must push a `room_state` whose `peers` field is the
+    // current `Node::peers()` — not an empty placeholder. This is the exact
+    // regression that left the WS `peers` pane blank even after handshake OK.
+    let (mut ws, state) = connect_with_state().await;
+
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"616161"}}),
+    )
+    .await;
+    let _ack = read_json(&mut ws).await;
+    let initial_rs = read_json(&mut ws).await;
+    assert_eq!(initial_rs["type"], "room_state");
+    assert_eq!(
+        initial_rs["payload"]["peers"].as_array().unwrap().len(),
+        0,
+        "no peers attached yet — empty list expected"
+    );
+
+    // Run a real handshake so `Node::peers()` actually contains an entry.
+    attach_handshaked_peer(&state).await;
+
+    // Session loop should observe PeerConnected and fan a fresh room_state.
+    let pushed = read_json(&mut ws).await;
+    assert_eq!(pushed["type"], "room_state");
+    assert_eq!(pushed["payload"]["room"], "616161");
+    assert_eq!(pushed["payload"]["joined"], true);
+    let peers = pushed["payload"]["peers"].as_array().expect("peers array");
+    assert_eq!(
+        peers.len(),
+        1,
+        "PeerConnected must push the real peer list, not []"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_disconnected_event_pushes_updated_room_state() {
+    // Symmetric: after a peer drops, the next fanned room_state must reflect
+    // the shrunken peers list.
+    let (mut ws, state) = connect_with_state().await;
+    let peer_id = attach_handshaked_peer(&state).await;
+
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"717171"}}),
+    )
+    .await;
+    let _ack = read_json(&mut ws).await;
+
+    // Drain any room_state frames in flight until we've seen the one
+    // reflecting the attached peer (peers.len == 1), then issue disconnect.
+    let mut saw_one = false;
+    for _ in 0..4 {
+        let frame = read_json(&mut ws).await;
+        if frame["type"] == "room_state" && frame["payload"]["peers"].as_array().unwrap().len() == 1 {
+            saw_one = true;
+            break;
+        }
+    }
+    assert!(saw_one, "expected a room_state with one peer before disconnect");
+
+    state.node.disconnect_peer(&peer_id).await.expect("disconnect");
+
+    // Expect a room_state with peers = [] eventually.
+    let mut saw_empty = false;
+    for _ in 0..4 {
+        let frame = read_json(&mut ws).await;
+        assert_eq!(frame["type"], "room_state", "unexpected frame while waiting for empty peers");
+        if frame["payload"]["peers"].as_array().unwrap().is_empty() {
+            saw_empty = true;
+            break;
+        }
+    }
+    assert!(saw_empty, "PeerDisconnected must push an updated room_state with empty peers");
+}
+
 #[tokio::test]
 async fn join_drains_backlog_from_queue() {
     // A message pushed into the queue before any client has subscribed must

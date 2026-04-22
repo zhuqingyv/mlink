@@ -132,7 +132,7 @@ pub async fn run(mut socket: WebSocket, state: DaemonState) {
             ev = events.recv() => {
                 match ev {
                     Ok(ev) => {
-                        if !forward_peer_event(&mut socket, &handle, ev).await {
+                        if !forward_peer_event(&mut socket, &state, &handle, ev).await {
                             break;
                         }
                     }
@@ -484,8 +484,16 @@ async fn handle_ping(socket: &mut WebSocket, id: Option<&str>) -> bool {
 /// ignored here — message routing goes through the central fan-out worker
 /// that queues and dispatches per-subscription, so handling it here would
 /// either duplicate delivery or race with the queue path.
+///
+/// On PeerConnected / PeerDisconnected we push a fresh `room_state` containing
+/// the *real* peer list (from `Node::peers()`) to every room this session is
+/// subscribed to. The Node does not track a peer→room map, but every connected
+/// peer has already passed the daemon's room-hash intersection check during
+/// handshake — so reporting the full connected set per subscribed room is
+/// consistent with what the daemon is actually willing to route.
 async fn forward_peer_event(
     socket: &mut WebSocket,
+    state: &DaemonState,
     handle: &SessionHandle,
     ev: NodeEvent,
 ) -> bool {
@@ -499,7 +507,7 @@ async fn forward_peer_event(
     match ev {
         NodeEvent::PeerConnected { .. } | NodeEvent::PeerDisconnected { .. } => {
             for code in &codes {
-                if !send_room_state_empty_peers(socket, code, true).await {
+                if !send_room_state(socket, state, code, true).await {
                     return false;
                 }
             }
@@ -540,22 +548,6 @@ async fn send_room_state(
         "room_state",
         None,
         RoomStatePayload { room: code, peers, joined },
-    );
-    send(socket, frame).await
-}
-
-async fn send_room_state_empty_peers(
-    socket: &mut WebSocket,
-    code: &str,
-    joined: bool,
-) -> bool {
-    // Called from `forward_peer_event` which doesn't have `DaemonState` in
-    // scope. Clients that care about the fresh peer list will already issue a
-    // follow-up `join`; the event here is a cheap "something changed" nudge.
-    let frame = encode_frame(
-        "room_state",
-        None,
-        RoomStatePayload { room: code, peers: Vec::new(), joined },
     );
     send(socket, frame).await
 }
