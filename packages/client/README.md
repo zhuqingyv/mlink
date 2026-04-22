@@ -1,20 +1,23 @@
-# @mlink/client
+# mlink-client
 
 WebSocket client SDK for the mlink daemon. Works in Node.js (>=18) and modern browsers.
 
 ## Install
 
 ```bash
-npm install @mlink/client
+npm install mlink-client
 ```
 
 ## Quick start
 
 ```js
-const { MlinkClient } = require("@mlink/client");
+const { MlinkClient } = require("mlink-client");
 
-const client = new MlinkClient(); // auto-discovers the daemon port
+// Pick a random free port automatically (Node only):
+const client = new MlinkClient();
 await client.connect();
+console.log("port:", client.port);
+
 await client.join("123456");
 
 client.on("message", (msg) => {
@@ -24,19 +27,27 @@ client.on("message", (msg) => {
 await client.send("123456", { text: "hello" });
 ```
 
+Or specify a port explicitly:
+
+```js
+const client = new MlinkClient({ port: 7878 });
+await client.connect();
+```
+
 ## API
 
 ### `new MlinkClient(options?)`
 
-| option                 | default                                     | notes                                                  |
-| ---------------------- | ------------------------------------------- | ------------------------------------------------------ |
-| `url`                  | `ws://127.0.0.1:<port>/ws` from `daemon.json` | Required in browsers.                                  |
-| `daemonInfoPath`       | `~/.mlink/daemon.json`                      | Node only. Env `MLINK_DAEMON_FILE` also honoured.      |
-| `clientName`           | `undefined`                                 | Sent in the `hello` frame; daemon logs it.             |
-| `pingIntervalMs`       | `30000`                                     | `0` disables heartbeat.                                |
-| `requestTimeoutMs`     | `10000`                                     | Reject timer for `join` / `leave` / `send`.            |
-| `autoReconnect`        | `true`                                      | Exponential backoff 1/2/4/8…s capped at the next knob. |
-| `maxReconnectDelayMs`  | `30000`                                     | Upper cap on backoff.                                  |
+| option                 | default     | notes                                                                                                 |
+| ---------------------- | ----------- | ----------------------------------------------------------------------------------------------------- |
+| `port`                 | *auto*      | Daemon port. When omitted, SDK probes a free port via `net.createServer().listen(0)` on connect (Node only). |
+| `clientName`           | `undefined` | Sent in the `hello` frame; daemon logs it.                                                            |
+| `pingIntervalMs`       | `30000`     | `0` disables heartbeat.                                                                               |
+| `requestTimeoutMs`     | `10000`     | Reject timer for `join` / `leave` / `send`.                                                           |
+| `autoReconnect`        | `true`      | Exponential backoff 1/2/4/8…s capped at the next knob.                                                |
+| `maxReconnectDelayMs`  | `30000`     | Upper cap on backoff.                                                                                 |
+
+Connection URL is always `ws://127.0.0.1:${port}/ws`.
 
 ### Methods
 
@@ -50,7 +61,7 @@ await client.send("123456", { text: "hello" });
 ### Properties
 
 - `appUuid: string` — this daemon's app_uuid (available after `ready`).
-- `port: number` — daemon port the client is pointed at. Resolved from `daemon.json` or the `url` option at construction time.
+- `port: number` — daemon port in use. Equals the `port` option when supplied; otherwise `0` until the first `connect()` probes a free port, then stable.
 - `rooms: string[]` — currently joined rooms.
 
 ### Events
@@ -73,10 +84,10 @@ Requests carry an auto-incremented `id`; the matching `ack` resolves the returne
 
 ## Browser usage
 
-In browsers you must pass `url` explicitly — file-system discovery is unavailable:
+In browsers you must pass `port` explicitly — automatic port probing uses Node's `net` module and is not available:
 
 ```js
-const client = new MlinkClient({ url: "ws://127.0.0.1:7878/ws" });
+const client = new MlinkClient({ port: 7878 });
 ```
 
 The native `WebSocket` global is used automatically; the `ws` dependency is Node-only.

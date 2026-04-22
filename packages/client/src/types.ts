@@ -32,10 +32,12 @@ export interface MlinkError {
 }
 
 export interface ClientOptions {
-  /** Full ws URL. When omitted, Node reads `~/.mlink/daemon.json` to find the port. */
-  url?: string;
-  /** Override the path to daemon.json. Node only. */
-  daemonInfoPath?: string;
+  /**
+   * Daemon port to connect to. When omitted the SDK picks a free port via
+   * `net.createServer().listen(0)` on first `connect()` (Node only). Read
+   * the resolved value back from `client.port`.
+   */
+  port?: number;
   /** Client name sent in the `hello` frame (informational, logged by daemon). */
   clientName?: string;
   /** Milliseconds between ping frames. 0 disables heartbeat. Default 30_000. */

@@ -40,55 +40,50 @@ function resolveWSImpl(): WSCtor {
   return (mod.WebSocket ?? mod.default ?? mod) as WSCtor;
 }
 
-function parsePortFromUrl(url: string): number {
-  // Extract the port out of a ws:// or wss:// URL. WHATWG URL normalises
-  // default-port removal (80 for ws, 443 for wss), so fall back to those
-  // when `port` comes back empty.
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`MlinkClient: invalid url '${url}'`);
-  }
-  if (parsed.port) {
-    const n = Number(parsed.port);
-    if (Number.isFinite(n) && n > 0) {
-      return n;
-    }
-  }
-  if (parsed.protocol === "wss:" || parsed.protocol === "https:") {
-    return 443;
-  }
-  if (parsed.protocol === "ws:" || parsed.protocol === "http:") {
-    return 80;
-  }
-  throw new Error(`MlinkClient: cannot derive port from url '${url}'`);
+function isNodeRuntime(): boolean {
+  return (
+    typeof process !== "undefined" &&
+    !!(process as unknown as { versions?: { node?: string } }).versions?.node
+  );
 }
 
-function readDaemonInfo(overridePath?: string): { port: number } {
-  // Browser guard — the caller must provide `url` there.
-  const isNode =
-    typeof process !== "undefined" &&
-    !!(process as unknown as { versions?: { node?: string } }).versions?.node;
-  if (!isNode) {
-    throw new Error(
-      "MlinkClient: no url provided and not running under Node — pass options.url in browser environments",
+/**
+ * Probe a free TCP port on the loopback interface by listening on 0 and
+ * reading the assigned port back, then releasing it. Node-only; the kernel
+ * may reassign this port to someone else between release and actual use, so
+ * callers should bind immediately after — there is an inherent TOCTOU race
+ * we cannot close without keeping the socket live.
+ */
+function probeFreePort(): Promise<number> {
+  if (!isNodeRuntime()) {
+    return Promise.reject(
+      new Error(
+        "MlinkClient: automatic port selection is Node-only — pass options.port in browser environments",
+      ),
     );
   }
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { readFileSync } = require("fs") as typeof import("fs");
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { join } = require("path") as typeof import("path");
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { homedir } = require("os") as typeof import("os");
-  const envOverride = process.env.MLINK_DAEMON_FILE;
-  const path = overridePath ?? envOverride ?? join(homedir(), ".mlink", "daemon.json");
-  const raw = readFileSync(path, "utf8");
-  const parsed = JSON.parse(raw) as { port?: unknown };
-  if (typeof parsed.port !== "number" || !Number.isFinite(parsed.port)) {
-    throw new Error(`MlinkClient: daemon.json at ${path} missing numeric 'port'`);
-  }
-  return { port: parsed.port };
+  const net = require("net") as typeof import("net");
+  return new Promise<number>((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      if (addr === null || typeof addr === "string") {
+        srv.close();
+        reject(new Error("MlinkClient: unable to resolve probe address"));
+        return;
+      }
+      const port = addr.port;
+      srv.close((err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(port);
+        }
+      });
+    });
+  });
 }
 
 interface PendingRequest {
@@ -109,24 +104,29 @@ export interface MlinkClient {
 /**
  * WebSocket client for mlink daemon.
  *
- * Lifecycle: `connect()` opens the socket, waits for `ready`, and resolves.
- * `join` / `leave` / `send` issue request frames with an auto-incremented id
- * and resolve when the daemon acks (or reject on `error`). Incoming `message`
- * and `room_state` frames emit events.
+ * Port resolution:
+ *   - `new MlinkClient({ port })` → use the given port.
+ *   - `new MlinkClient()`         → pick a random free port (Node, probed on
+ *     first `connect()`). Read it back via `client.port` after connect.
  *
- * On an unexpected socket close, if `autoReconnect` is enabled the client
+ * Connection URL is always `ws://127.0.0.1:${port}/ws`.
+ *
+ * Lifecycle: `connect()` resolves the port (if needed), opens the socket,
+ * waits for the daemon's `ready` frame, and resolves. `join` / `leave` /
+ * `send` issue request frames with an auto-incremented id and resolve when
+ * the daemon acks (or reject on `error`). On unexpected disconnect the client
  * reconnects with 1/2/4/8…s exponential backoff (capped at `maxReconnectDelayMs`)
  * and re-joins any rooms that were active before the drop.
  */
 export class MlinkClient extends EventEmitter {
-  private readonly url: string;
-  private readonly _port: number;
+  private readonly requestedPort: number | undefined;
   private readonly clientName?: string;
   private readonly pingIntervalMs: number;
   private readonly requestTimeoutMs: number;
   private readonly autoReconnect: boolean;
   private readonly maxReconnectDelayMs: number;
 
+  private _port = 0;
   private ws: WSLike | null = null;
   private nextId = 1;
   private readonly pending = new Map<string, PendingRequest>();
@@ -147,14 +147,17 @@ export class MlinkClient extends EventEmitter {
     // would crash the process — swallow the default behaviour. Callers who
     // care attach their own listener.
     this.on("error", () => {});
-    if (options.url) {
-      this.url = options.url;
-      this._port = parsePortFromUrl(options.url);
+
+    if (options.port !== undefined) {
+      if (!Number.isInteger(options.port) || options.port <= 0 || options.port > 65535) {
+        throw new Error(`MlinkClient: invalid port ${options.port}`);
+      }
+      this.requestedPort = options.port;
+      this._port = options.port;
     } else {
-      const { port } = readDaemonInfo(options.daemonInfoPath);
-      this.url = `ws://127.0.0.1:${port}/ws`;
-      this._port = port;
+      this.requestedPort = undefined;
     }
+
     this.clientName = options.clientName;
     this.pingIntervalMs = options.pingIntervalMs ?? 30_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
@@ -167,9 +170,9 @@ export class MlinkClient extends EventEmitter {
   }
 
   /**
-   * Daemon port this client is pointed at. Resolved at construction time
-   * from either the explicit `url` option or `~/.mlink/daemon.json`. Stable
-   * for the lifetime of the instance.
+   * Daemon port in use. Equals the `port` option when supplied; otherwise
+   * `0` until the first `connect()` call probes a free port, after which
+   * the probed value is stable for the lifetime of the instance.
    */
   get port(): number {
     return this._port;
@@ -194,22 +197,36 @@ export class MlinkClient extends EventEmitter {
       return this.connectPromise;
     }
     this.closedByUser = false;
-    this.connectPromise = this.openSocket();
+    const p = this.resolvePort().then(() => this.openSocket());
+    this.connectPromise = p;
     // Clear the cache once the promise settles so a later reconnect can
-    // produce a fresh one.
-    this.connectPromise.finally(() => {
-      this.connectPromise = null;
-    });
-    return this.connectPromise;
+    // produce a fresh one. We attach via then/catch on a *separate*
+    // branch rather than .finally on the returned promise, to avoid
+    // creating a second unhandled-rejection surface.
+    const clear = () => {
+      if (this.connectPromise === p) {
+        this.connectPromise = null;
+      }
+    };
+    p.then(clear, clear);
+    return p;
+  }
+
+  private async resolvePort(): Promise<void> {
+    if (this._port !== 0) {
+      return;
+    }
+    this._port = await probeFreePort();
   }
 
   private openSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
       let settled = false;
       const Ctor = resolveWSImpl();
+      const url = `ws://127.0.0.1:${this._port}/ws`;
       let ws: WSLike;
       try {
-        ws = new Ctor(this.url);
+        ws = new Ctor(url);
       } catch (e) {
         reject(e instanceof Error ? e : new Error(String(e)));
         return;
@@ -284,6 +301,13 @@ export class MlinkClient extends EventEmitter {
     this.emit("reconnecting", this.reconnectAttempt, base);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      // Guard against disconnect() racing with the timer firing: if the user
+      // tore the client down, abandon the reconnect. Without this, a dangling
+      // openSocket() promise rejection could fire after the caller thinks the
+      // client is gone.
+      if (this.closedByUser) {
+        return;
+      }
       this.openSocket().then(
         () => {
           this.reconnectAttempt = 0;
@@ -434,7 +458,6 @@ export class MlinkClient extends EventEmitter {
     switch (frame.type) {
       case "ready": {
         this._appUuid = frame.payload.app_uuid;
-        // If `hello` was sent with an id, daemon also acks it; we don't wait.
         onReady({ appUuid: frame.payload.app_uuid, version: frame.payload.version });
         return;
       }
@@ -496,15 +519,9 @@ export class MlinkClient extends EventEmitter {
         return;
       }
       case "pong": {
-        // Heartbeat — nothing to do. An id-correlated pong is allowed to
-        // resolve a pending ping request, but we don't expose ping() so no
-        // pending entry exists.
         return;
       }
       default: {
-        // Unknown frame type — ignore. A forward-compatible daemon might send
-        // new types; erroring here would break old clients talking to new
-        // daemons.
         return;
       }
     }
