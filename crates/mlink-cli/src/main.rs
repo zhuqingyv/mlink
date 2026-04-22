@@ -44,6 +44,7 @@ async fn run(cli: Cli) -> Result<(), MlinkError> {
         }
         Some(Commands::Listen) => cmd_listen(kind).await,
         Some(Commands::Chat { code }) => cmd_chat(code, kind).await,
+        Some(Commands::Join { code, chat }) => cmd_join(code, chat, kind).await,
 
         Some(Commands::Scan) => cmd_scan(kind).await,
         Some(Commands::Connect { peer_id }) => cmd_connect(peer_id, kind).await,
@@ -226,7 +227,14 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
     // the next scan round (used when a dial fails and we want a retry).
     let (peer_tx, mut peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
     let (unsee_tx, unsee_rx) = mpsc::channel::<String>(16);
-    if room_hash_bytes.is_some() {
+    // `cmd_serve` is the host path. For BLE we deliberately skip the scanner
+    // entirely — BLE connections are strictly peripheral-only from the host;
+    // the joining side runs `mlink join <code>` and does all the scanning /
+    // dialling. TCP keeps the legacy symmetric behaviour (it has no role
+    // ambiguity because every node can freely accept + dial without stepping
+    // on its own advertisement).
+    let ble_host_only = matches!(kind, TransportKind::Ble);
+    if room_hash_bytes.is_some() && !ble_host_only {
         let app_uuid = node.app_uuid().to_string();
         let hash = room_hash_bytes.expect("is_some checked above");
         let scan_transport: Box<dyn Transport> = match kind {
@@ -251,10 +259,11 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
             }
         });
     } else {
-        // No room → no scanner task → nothing will ever read `unsee_rx`.
+        // No scanner task → nothing will ever read `unsee_rx`.
         // Drop it explicitly so the channel has no receiver and sends from
         // the main loop fail-fast instead of filling the buffer.
         drop(unsee_rx);
+        let _ = peer_tx;
     }
 
     let mut events = node.subscribe();
@@ -602,9 +611,13 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
     }
 
     // --- Scan loop (room-filtered) ---------------------------------------
+    // Host-mode chat: BLE skips the scanner entirely (peripheral-only) — the
+    // joining side runs `mlink join --chat <code>` and is responsible for all
+    // discovery and dialling. TCP keeps the legacy symmetric behaviour.
     let (peer_tx, mut peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
     let (unsee_tx, unsee_rx) = mpsc::channel::<String>(16);
-    {
+    let ble_host_only = matches!(kind, TransportKind::Ble);
+    if !ble_host_only {
         let app_uuid = node.app_uuid().to_string();
         let scan_transport: Box<dyn Transport> = match kind {
             TransportKind::Ble => {
@@ -627,6 +640,9 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                 eprintln!("[mlink] scanner error: {e}");
             }
         });
+    } else {
+        drop(unsee_rx);
+        let _ = peer_tx;
     }
 
     // --- Stdin reader ----------------------------------------------------
@@ -846,6 +862,237 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
             ev = events.recv() => {
                 match ev {
                     Ok(NodeEvent::MessageReceived { peer_id, payload }) => {
+                        let name = peer_names.get(&peer_id).cloned().unwrap_or_else(|| peer_id.clone());
+                        let text = match std::str::from_utf8(&payload) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => format!("<{} bytes binary>", payload.len()),
+                        };
+                        println!("[{name}] {text}");
+                    }
+                    Ok(NodeEvent::PeerConnected { peer_id }) => {
+                        println!("[mlink] peer connected: {peer_id}");
+                        connected_peers.insert(peer_id);
+                    }
+                    Ok(NodeEvent::PeerDisconnected { peer_id }) => {
+                        println!("[mlink] peer disconnected: {peer_id}");
+                        connected_peers.remove(&peer_id);
+                        wire_to_app.retain(|_, app| app != &peer_id);
+                        if let Some(h) = readers.remove(&peer_id) {
+                            h.abort();
+                        }
+                    }
+                    Ok(NodeEvent::PeerLost { peer_id }) => {
+                        println!("[mlink] peer lost: {peer_id}");
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    for (_, h) in readers.drain() {
+        h.abort();
+    }
+    node.stop().await?;
+    Ok(())
+}
+
+/// Joining-side entrypoint. Runs scanner + dial only — no peripheral
+/// advertisement, no accept loop. Pairs with the host running `mlink <code>`
+/// (or `mlink chat <code>`) on the other device. When `chat` is true we also
+/// wire up a stdin reader and spawn per-peer message readers so typed lines
+/// broadcast and inbound messages print inline (same shape as `cmd_chat`).
+async fn cmd_join(code: String, chat: bool, kind: TransportKind) -> Result<(), MlinkError> {
+    validate_room_code(&code)?;
+
+    let mut node = build_node().await?;
+    let hash = room_hash(&code);
+    node.set_room_hash(Some(hash));
+    node.start().await?;
+
+    println!("[mlink] joining room {code}");
+    println!(
+        "[mlink] joining as {} via {} — scanning for host...",
+        node.app_uuid(),
+        transport_label(kind)
+    );
+    if chat {
+        println!("[mlink] chat mode: type a line and press Enter to broadcast");
+    }
+
+    // --- Scan loop (room-filtered) ---------------------------------------
+    let (peer_tx, mut peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
+    let (unsee_tx, unsee_rx) = mpsc::channel::<String>(16);
+    {
+        let app_uuid = node.app_uuid().to_string();
+        let scan_transport: Box<dyn Transport> = match kind {
+            TransportKind::Ble => {
+                let mut t = BleTransport::new();
+                t.set_room_hash(hash);
+                Box::new(t)
+            }
+            TransportKind::Tcp => {
+                let mut t = TcpTransport::new();
+                t.set_room_hash(hash);
+                t.set_app_uuid(app_uuid.clone());
+                Box::new(t)
+            }
+        };
+        let mut scanner = Scanner::new(scan_transport, app_uuid);
+        scanner.set_room_hashes(vec![hash]);
+        scanner.set_unsee_channel(unsee_rx);
+        tokio::spawn(async move {
+            if let Err(e) = scanner.discover_loop(peer_tx).await {
+                eprintln!("[mlink] scanner error: {e}");
+            }
+        });
+    }
+
+    // --- Optional stdin reader (chat mode) ------------------------------
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(16);
+    if chat {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let stdin = tokio::io::stdin();
+            let mut lines = BufReader::new(stdin).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if stdin_tx.send(line).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        eprintln!("[mlink] stdin read error: {e}");
+                        return;
+                    }
+                }
+            }
+        });
+    } else {
+        drop(stdin_tx);
+    }
+
+    let mut events = node.subscribe();
+    let mut connect_transport: Box<dyn Transport> = match kind {
+        TransportKind::Ble => Box::new(BleTransport::new()),
+        TransportKind::Tcp => Box::new(TcpTransport::new()),
+    };
+    use std::collections::{HashMap, HashSet};
+    let mut engaged_wire_ids: HashSet<String> = HashSet::new();
+    const MAX_RETRIES: u8 = 3;
+    let mut attempts: HashMap<String, u8> = HashMap::new();
+    let mut connected_peers: HashSet<String> = HashSet::new();
+    let mut wire_to_app: HashMap<String, String> = HashMap::new();
+    let mut readers: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut peer_names: HashMap<String, String> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                println!("\n[mlink] bye");
+                break;
+            }
+            maybe_line = stdin_rx.recv() => {
+                // `stdin_rx` is closed when `chat == false`; recv() returns None
+                // on every tick and the arm becomes inert, which is the intent.
+                let Some(line) = maybe_line else { continue; };
+                let peers = node.peers().await;
+                if peers.is_empty() {
+                    println!("[mlink] (no peers yet — message dropped)");
+                    continue;
+                }
+                for p in &peers {
+                    if let Err(e) = node
+                        .send_raw(&p.id, MessageType::Message, line.as_bytes())
+                        .await
+                    {
+                        eprintln!("[mlink] send to {} failed: {e}", p.id);
+                    }
+                }
+            }
+            maybe_peer = peer_rx.recv() => {
+                let peer = match maybe_peer {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if engaged_wire_ids.contains(&peer.id) {
+                    continue;
+                }
+                if let Some(app) = wire_to_app.get(&peer.id) {
+                    if connected_peers.contains(app) {
+                        continue;
+                    }
+                }
+                // In join mode we always dial — no role arbitration is needed
+                // because the host deliberately does not dial back. This is
+                // the whole point of the host/join split.
+                let attempt = attempts.entry(peer.id.clone()).or_insert(0);
+                if *attempt >= MAX_RETRIES {
+                    eprintln!(
+                        "[mlink:conn] join: giving up on {} after {} attempts",
+                        peer.id, *attempt
+                    );
+                    continue;
+                }
+                *attempt += 1;
+                let attempt_no = *attempt;
+                engaged_wire_ids.insert(peer.id.clone());
+                println!(
+                    "[mlink] discovered {} ({}) — connecting (attempt {}/{})...",
+                    peer.name, peer.id, attempt_no, MAX_RETRIES
+                );
+                let peer_wire_id = peer.id.clone();
+                let peer_wire_name = peer.name.clone();
+                let dial_result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    node.connect_peer(connect_transport.as_mut(), &peer),
+                )
+                .await;
+                let dial_result = match dial_result {
+                    Ok(inner) => inner,
+                    Err(_) => Err(MlinkError::HandlerError(format!(
+                        "connect to {} timed out after {:?}",
+                        peer_wire_id, CONNECT_TIMEOUT
+                    ))),
+                };
+                match dial_result {
+                    Ok(peer_id) => {
+                        println!("[mlink] + {peer_id}");
+                        attempts.remove(&peer_wire_id);
+                        peer_names.insert(peer_id.clone(), peer_wire_name);
+                        wire_to_app.insert(peer_wire_id.clone(), peer_id.clone());
+                        connected_peers.insert(peer_id.clone());
+                        if chat && !readers.contains_key(&peer_id) {
+                            readers.insert(peer_id.clone(), node.spawn_peer_reader(peer_id));
+                        }
+                    }
+                    Err(MlinkError::RoomMismatch { peer_id }) => {
+                        println!("[mlink] dropped {peer_id}: different room");
+                        attempts.insert(peer_wire_id.clone(), MAX_RETRIES);
+                        engaged_wire_ids.remove(&peer_wire_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[mlink] connect {} failed: {e}", peer_wire_id);
+                        engaged_wire_ids.remove(&peer_wire_id);
+                        let delay = random_backoff();
+                        let unsee_tx = unsee_tx.clone();
+                        let wire_id = peer_wire_id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = unsee_tx.send(wire_id).await;
+                        });
+                    }
+                }
+            }
+            ev = events.recv() => {
+                match ev {
+                    Ok(NodeEvent::MessageReceived { peer_id, payload }) if chat => {
                         let name = peer_names.get(&peer_id).cloned().unwrap_or_else(|| peer_id.clone());
                         let text = match std::str::from_utf8(&payload) {
                             Ok(s) => s.to_string(),

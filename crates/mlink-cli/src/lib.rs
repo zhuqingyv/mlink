@@ -42,8 +42,10 @@ pub fn validate_room_code(code: &str) -> Result<(), String> {
     name = "mlink",
     about = "Multi-to-multi local device connection layer",
     after_help = "Quick start:\n  \
-      mlink            # generate a new 6-digit room and start serving\n  \
-      mlink 482193     # join an existing room by its 6-digit code\n  \
+      mlink            # generate a new 6-digit room and host it (BLE peripheral only)\n  \
+      mlink 482193     # host an existing room code (BLE peripheral only)\n  \
+      mlink join 482193       # join an existing room as a BLE central\n  \
+      mlink join --chat 482193 # join + interactive chat\n  \
       mlink send 482193 hello"
 )]
 pub struct Cli {
@@ -79,10 +81,21 @@ pub enum Commands {
     },
     /// Listen on all joined rooms and print messages as they arrive
     Listen,
-    /// Interactive chat: join a room, print incoming messages, broadcast each stdin line
+    /// Interactive chat: join a room, print incoming messages, broadcast each stdin line.
+    /// Defaults to the host (BLE peripheral-only) role; pair with `mlink join --chat <code>`
+    /// from the peer device to dial in as a central.
     Chat {
         /// 6-digit room code
         code: String,
+    },
+    /// Join an existing room as a BLE central. Does not advertise — pair with
+    /// `mlink <code>` or `mlink chat <code>` on the host device.
+    Join {
+        /// 6-digit room code to join
+        code: String,
+        /// Enter interactive chat mode instead of the default listen-only loop
+        #[arg(long)]
+        chat: bool,
     },
 
     // ---- legacy peer-id commands (still supported) --------------------------

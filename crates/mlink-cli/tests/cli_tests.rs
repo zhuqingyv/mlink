@@ -324,6 +324,39 @@ fn test_transport_kind_rejects_empty_and_case_mismatch() {
     assert!(TransportKind::parse("Tcp").is_err());
 }
 
+// ---- Role split: `mlink join <code>` -------------------------------------
+
+#[test]
+fn test_join_command_parses() {
+    let cli = Cli::try_parse_from(["mlink", "join", "482193"]).expect("join should parse");
+    match cmd(&cli) {
+        Commands::Join { code, chat } => {
+            assert_eq!(code, "482193");
+            assert!(!chat, "default join must be non-chat");
+        }
+        other => panic!("expected Join, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_join_with_chat_flag() {
+    let cli = Cli::try_parse_from(["mlink", "join", "--chat", "482193"])
+        .expect("join --chat should parse");
+    match cmd(&cli) {
+        Commands::Join { code, chat } => {
+            assert_eq!(code, "482193");
+            assert!(chat, "chat must be true when --chat is set");
+        }
+        other => panic!("expected Join, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_join_missing_code_fails() {
+    let res = Cli::try_parse_from(["mlink", "join"]);
+    assert!(res.is_err(), "join without code must fail");
+}
+
 #[test]
 fn test_oneline_send_subcommand_still_works() {
     // Exactly what the hotfix task named: `mlink send 567892 "hello"`.
