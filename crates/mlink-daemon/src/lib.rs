@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
+use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -161,10 +162,26 @@ pub fn remove_daemon_info(path: &PathBuf) {
     }
 }
 
+/// Inlined web-debug page. Served at `GET /` so `mlink dev` can open a browser
+/// straight at the daemon with no external file dependency — handy for ad-hoc
+/// debugging without checking out the repo. Kept as a raw `include_str!` so
+/// any change to the HTML is picked up on the next build.
+pub const WEB_DEBUG_HTML: &str = include_str!("../../../examples/web-debug/index.html");
+
 /// Build the axum router. Split out so tests can mount the same routes on an
 /// arbitrary listener without going through `run()`.
 pub fn router(state: DaemonState) -> Router {
-    Router::new().route("/ws", get(ws_handler)).with_state(state)
+    Router::new()
+        .route("/", get(index_handler))
+        .route("/ws", get(ws_handler))
+        .with_state(state)
+}
+
+async fn index_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        WEB_DEBUG_HTML,
+    )
 }
 
 async fn ws_handler(
@@ -233,6 +250,15 @@ fn host_name() -> String {
 /// records `{port, pid}` in the daemon info file, serves WS until the task is
 /// cancelled, then cleans up the file on exit.
 pub async fn run() -> Result<(), DaemonError> {
+    let (_port, serve) = bind_and_prepare().await?;
+    serve.await_shutdown().await
+}
+
+/// Bind the listener, write the daemon-info file, and return the bound port
+/// alongside a future that serves requests until ctrl-c. Split from `run()`
+/// so callers like `mlink dev` can learn the port before the serve future
+/// resolves (needed to open the browser).
+pub async fn bind_and_prepare() -> Result<(u16, BoundServe), DaemonError> {
     let info_path = daemon_info_path()?;
     ensure_single_instance(&info_path)?;
 
@@ -252,21 +278,37 @@ pub async fn run() -> Result<(), DaemonError> {
     eprintln!("[mlink-daemon] listening on 127.0.0.1:{} (pid={})", info.port, info.pid);
 
     let app = router(state);
-
-    // `axum::serve(...)` returns a `Serve` future; `IntoFuture::into_future`
-    // isn't in scope here, so we wrap the `.await` in an inner async block
-    // and race it against ctrl-c at the same level.
-    let result = tokio::select! {
-        r = async { axum::serve(listener, app).await } => r.map_err(DaemonError::from),
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\n[mlink-daemon] shutting down");
-            Ok(())
-        }
-    };
-
-    remove_daemon_info(&info_path);
-    result
+    Ok((bound.port(), BoundServe { listener, app, info_path }))
 }
+
+/// Handle carrying a bound listener + router ready to be served. Kept opaque
+/// so `run()` and `mlink dev` share exactly the same ctrl-c + cleanup path.
+pub struct BoundServe {
+    listener: TcpListener,
+    app: Router,
+    info_path: PathBuf,
+}
+
+impl BoundServe {
+    /// Serve until ctrl-c, then remove the daemon-info file. Idempotent on
+    /// error — the file is always cleaned up on return.
+    pub async fn await_shutdown(self) -> Result<(), DaemonError> {
+        let BoundServe { listener, app, info_path } = self;
+        // `axum::serve(...)` returns a `Serve` future; `IntoFuture::into_future`
+        // isn't in scope here, so we wrap the `.await` in an inner async block
+        // and race it against ctrl-c at the same level.
+        let result = tokio::select! {
+            r = async { axum::serve(listener, app).await } => r.map_err(DaemonError::from),
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\n[mlink-daemon] shutting down");
+                Ok(())
+            }
+        };
+        remove_daemon_info(&info_path);
+        result
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

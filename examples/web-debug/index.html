@@ -265,7 +265,7 @@
   <!-- Top bar -->
   <div class="topbar">
     <span class="title">mlink WS Debug</span>
-    <input type="text" class="url" id="wsUrl" value="ws://127.0.0.1:7890/ws" placeholder="ws://host:port/ws">
+    <input type="text" class="url" id="wsUrl" value="" placeholder="ws://host:port/ws">
     <button id="btnConnect" class="primary">Connect</button>
     <button id="btnDisconnect" class="danger" disabled>Disconnect</button>
     <span class="status" id="connStatus"><span class="dot"></span><span id="connText">disconnected</span></span>
@@ -690,7 +690,26 @@
   }
 
   // --- init ---
+  // Default WS URL follows the page origin so the same HTML works regardless
+  // of which port the daemon bound to. When the page is opened directly from
+  // disk (file://) `location.host` is empty — fall back to 127.0.0.1:7890 so
+  // the manual-input + Connect button path still works.
+  function defaultWsUrl() {
+    const host = window.location && window.location.host;
+    if (!host) return "ws://127.0.0.1:7890/ws";
+    const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${scheme}//${host}/ws`;
+  }
+  wsUrl.value = defaultWsUrl();
   setStatus("err", "disconnected");
+
+  // Auto-connect when served by the daemon — `mlink dev` opens this page in a
+  // browser and the user expects the WS link to come up on its own.
+  if (window.location && window.location.host) {
+    // Defer one tick so the DOM is fully ready and the status pill repaints
+    // as "connecting…" before the socket call fires.
+    setTimeout(connect, 0);
+  }
 })();
 </script>
 </body>

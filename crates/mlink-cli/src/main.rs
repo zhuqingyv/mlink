@@ -38,6 +38,18 @@ async fn main() -> ExitCode {
         };
     }
 
+    // `mlink dev` = daemon + open the debug page in a browser. Same cleanup
+    // path as `daemon`, so we also dispatch before the outer `_exit` guard.
+    if matches!(cli.command, Some(Commands::Dev)) {
+        return match cmd_dev().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: dev: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Outer Ctrl+C guard. Long-running subcommands (serve/chat/join) each have
     // their own `select!` on `signal::ctrl_c()` for a graceful goodbye, but a
     // handful of paths in the transport layer can wedge cancellation — the BLE
@@ -99,6 +111,12 @@ async fn run(cli: Cli) -> Result<(), MlinkError> {
         Some(Commands::Trust { action }) => cmd_trust(action).await,
         Some(Commands::Doctor) => cmd_doctor(kind).await,
         Some(Commands::Daemon) => cmd_daemon().await,
+        // Unreachable in practice — `mlink dev` is dispatched before the
+        // outer ctrl-c guard in `main()` so it owns its own teardown path.
+        // Kept here only to satisfy the exhaustive match.
+        Some(Commands::Dev) => cmd_dev()
+            .await
+            .map_err(|e| MlinkError::HandlerError(format!("dev: {e}"))),
 
         // No subcommand → one-shot "join or create a room" mode.
         None => {
@@ -1554,6 +1572,56 @@ async fn cmd_daemon() -> Result<(), MlinkError> {
     mlink_daemon::run()
         .await
         .map_err(|e| MlinkError::HandlerError(format!("daemon: {e}")))
+}
+
+/// `mlink dev` — start the daemon, open the in-browser debug page, and wait
+/// for ctrl-c. We split `mlink_daemon::run()` into `bind_and_prepare` +
+/// `await_shutdown` so we can learn the bound port before blocking on the
+/// serve future; otherwise the browser would race the listener.
+async fn cmd_dev() -> Result<(), mlink_daemon::DaemonError> {
+    let (port, serve) = mlink_daemon::bind_and_prepare().await?;
+    let url = format!("http://127.0.0.1:{port}/");
+    eprintln!("[mlink-dev] opening {url}");
+    if let Err(e) = open_url(&url) {
+        // Not fatal — the daemon is live and the URL is printed above, so a
+        // manual click still works.
+        eprintln!("[mlink-dev] could not auto-open browser: {e}");
+        eprintln!("[mlink-dev] open {url} manually");
+    }
+    serve.await_shutdown().await
+}
+
+/// Spawn the platform's default URL handler. No `open` crate dependency —
+/// three one-liners per OS is cheaper than another transitive tree. Errors
+/// bubble up so the caller can print a manual-click fallback.
+fn open_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `cmd /C start "" <url>` is the only invocation that handles URLs
+        // containing `&` correctly; the empty `""` is the window-title slot.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = url;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no known browser-opener on this platform",
+        ))
+    }
 }
 
 async fn tcp_loopback_check() -> Result<u16, MlinkError> {

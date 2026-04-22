@@ -118,6 +118,10 @@ pub enum Commands {
     /// Writes `~/.mlink/daemon.json` with the bound port + pid; refuses to
     /// start if a previous daemon is still alive.
     Daemon,
+    /// Start the daemon and open the in-browser debug UI. Same single-instance
+    /// semantics as `mlink daemon`; automatically launches the platform's
+    /// default browser at the bound port. Ctrl-C stops the daemon.
+    Dev,
 }
 
 #[derive(Subcommand, Debug)]
