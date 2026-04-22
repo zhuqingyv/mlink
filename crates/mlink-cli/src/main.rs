@@ -136,6 +136,11 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
         TransportKind::Ble => {
             let mut listen_transport = BleTransport::new();
             listen_transport.set_local_name(local_name.clone());
+            // Plumb our app_uuid into the peripheral so advertisements carry
+            // the 0000FFBB-prefixed identity UUID (see ble.rs::encode_identity_uuid).
+            // Without this, the scanner on the peer can't pick a deterministic
+            // role and both sides race to dial.
+            listen_transport.set_app_uuid(node.app_uuid().to_string());
             if let Some(h) = room_hash_bytes {
                 listen_transport.set_room_hash(h);
             }
@@ -319,6 +324,41 @@ async fn cmd_serve(room_code: Option<String>, kind: TransportKind) -> Result<(),
                         continue;
                     }
                 }
+                // BLE symmetric-dial guard: the peer's advertisement carries
+                // its 8-byte app identity (via the 0000FFBB-prefixed service
+                // UUID) in `peer.metadata`. If our own app_uuid compares less
+                // than the peer's identity, we skip dialling and wait for the
+                // inbound subscribe — only one side should dial. `None` from
+                // should_dial_as_central (invalid local uuid, tie) falls back
+                // to the legacy symmetric-dial path so nothing hangs.
+                if matches!(kind, TransportKind::Ble) && peer.metadata.len() == 8 {
+                    let mut id = [0u8; 8];
+                    id.copy_from_slice(&peer.metadata);
+                    match mlink_core::transport::ble::should_dial_as_central(
+                        node.app_uuid(),
+                        &id,
+                    ) {
+                        Some(false) => {
+                            eprintln!(
+                                "[mlink:conn] serve: skip dial {} — peer outranks us, waiting for inbound",
+                                peer.id
+                            );
+                            continue;
+                        }
+                        Some(true) => {
+                            eprintln!(
+                                "[mlink:conn] serve: role=central for {} (we outrank peer)",
+                                peer.id
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "[mlink:conn] serve: role tie/invalid for {} — falling back to symmetric dial",
+                                peer.id
+                            );
+                        }
+                    }
+                }
                 let attempt = attempts.entry(peer.id.clone()).or_insert(0);
                 if *attempt >= MAX_RETRIES {
                     eprintln!(
@@ -484,6 +524,9 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
         TransportKind::Ble => {
             let mut listen_transport = BleTransport::new();
             listen_transport.set_local_name(local_name.clone());
+            // See cmd_serve: the peer's scanner needs our identity UUID in
+            // the advertisement to pick a role without symmetric-dial racing.
+            listen_transport.set_app_uuid(node.app_uuid().to_string());
             listen_transport.set_room_hash(hash);
             let local_name_for_task = local_name.clone();
             tokio::spawn(async move {
@@ -669,6 +712,37 @@ async fn cmd_chat(code: String, kind: TransportKind) -> Result<(), MlinkError> {
                 if let Some(app) = wire_to_app.get(&peer.id) {
                     if connected_peers.contains(app) {
                         continue;
+                    }
+                }
+                // BLE role arbitration — same rationale as cmd_serve. The
+                // peer's 8-byte identity rides in `peer.metadata`; if we
+                // don't outrank it, skip and let them dial us.
+                if matches!(kind, TransportKind::Ble) && peer.metadata.len() == 8 {
+                    let mut id = [0u8; 8];
+                    id.copy_from_slice(&peer.metadata);
+                    match mlink_core::transport::ble::should_dial_as_central(
+                        node.app_uuid(),
+                        &id,
+                    ) {
+                        Some(false) => {
+                            eprintln!(
+                                "[mlink:conn] chat: skip dial {} — peer outranks us, waiting for inbound",
+                                peer.id
+                            );
+                            continue;
+                        }
+                        Some(true) => {
+                            eprintln!(
+                                "[mlink:conn] chat: role=central for {} (we outrank peer)",
+                                peer.id
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "[mlink:conn] chat: role tie/invalid for {} — falling back to symmetric dial",
+                                peer.id
+                            );
+                        }
                     }
                 }
                 let attempt = attempts.entry(peer.id.clone()).or_insert(0);

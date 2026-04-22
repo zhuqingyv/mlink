@@ -45,7 +45,9 @@ use uuid::Uuid;
 
 use crate::protocol::errors::{MlinkError, Result};
 
-use super::ble::{CTRL_CHAR_UUID, MLINK_SERVICE_UUID, RX_CHAR_UUID, TX_CHAR_UUID};
+use super::ble::{
+    encode_identity_uuid, CTRL_CHAR_UUID, MLINK_SERVICE_UUID, RX_CHAR_UUID, TX_CHAR_UUID,
+};
 use super::transport_trait::Connection;
 
 /// Events surfaced by the Obj-C delegate into async land.
@@ -135,6 +137,7 @@ pub struct MacPeripheral {
     subscribed: Arc<SubscribedCentrals>,
     local_name: String,
     room_hash: Option<[u8; 8]>,
+    app_uuid: Option<String>,
 }
 
 impl MacPeripheral {
@@ -144,6 +147,7 @@ impl MacPeripheral {
     pub async fn start(
         local_name: impl Into<String>,
         room_hash: Option<[u8; 8]>,
+        app_uuid: Option<String>,
     ) -> Result<Self> {
         let local_name = local_name.into();
 
@@ -219,7 +223,7 @@ impl MacPeripheral {
                 msg_send_id![alloc, initWithDelegate: delegate_proto, queue: queue_obj]
             };
 
-            let ad_dict = build_advertisement_data(&advertised_name)?;
+            let ad_dict = build_advertisement_data(&advertised_name, app_uuid.as_deref())?;
 
             SetupHolder {
                 manager,
@@ -294,6 +298,7 @@ impl MacPeripheral {
             subscribed,
             local_name,
             room_hash,
+            app_uuid,
         })
     }
 
@@ -303,6 +308,10 @@ impl MacPeripheral {
 
     pub fn room_hash(&self) -> Option<&[u8; 8]> {
         self.room_hash.as_ref()
+    }
+
+    pub fn app_uuid(&self) -> Option<&str> {
+        self.app_uuid.as_deref()
     }
 
     /// Await the next control-plane delegate event. Returns `None` if the
@@ -851,10 +860,26 @@ fn attach_characteristics(
     }
 }
 
-fn build_advertisement_data(name: &str) -> Result<Retained<NSDictionary<NSString, AnyObject>>> {
+fn build_advertisement_data(
+    name: &str,
+    app_uuid: Option<&str>,
+) -> Result<Retained<NSDictionary<NSString, AnyObject>>> {
     let ns_name = NSString::from_str(name);
-    let ns_uuid = cb_uuid_from(MLINK_SERVICE_UUID)?;
-    let uuids: Retained<NSArray<CBUUID>> = NSArray::from_slice(&[&*ns_uuid]);
+    let ns_service_uuid = cb_uuid_from(MLINK_SERVICE_UUID)?;
+    // Second service UUID carries the first 8 bytes of our app_uuid so
+    // scanners can pick a central/peripheral role before dialling. If the
+    // caller didn't supply an app_uuid, fall back to a single-UUID ad so
+    // listen() still works on older paths.
+    let identity_uuid: Option<Retained<CBUUID>> = match app_uuid
+        .and_then(encode_identity_uuid)
+    {
+        Some(u) => Some(cb_uuid_from(u)?),
+        None => None,
+    };
+    let uuids: Retained<NSArray<CBUUID>> = match identity_uuid.as_deref() {
+        Some(id) => NSArray::from_slice(&[&*ns_service_uuid, id]),
+        None => NSArray::from_slice(&[&*ns_service_uuid]),
+    };
 
     let keys: [&NSString; 2] = unsafe {
         [
@@ -982,6 +1007,34 @@ mod tests {
     #[test]
     fn cb_uuid_from_accepts_mlink_service_uuid() {
         let _ = cb_uuid_from(MLINK_SERVICE_UUID).expect("valid uuid");
+    }
+
+    #[test]
+    fn build_advertisement_data_builds_for_all_three_app_uuid_variants() {
+        // Smoke-test every combination the CLI can hit:
+        //  1. a well-formed app_uuid -> 2-UUID advertisement,
+        //  2. no app_uuid -> 1-UUID advertisement,
+        //  3. a malformed app_uuid -> must NOT fail bring-up; silently drop
+        //     the identity UUID so the peripheral still advertises the mlink
+        //     service. We only assert Ok() here — the array-length check
+        //     is intentionally avoided because `NSDictionary::objectForKey`
+        //     return typing for arbitrary-value dicts is awkward to cast
+        //     safely; full identity-UUID encoding round-trips live in
+        //     ble.rs::tests and don't need CoreBluetooth mocked.
+        let with_app = build_advertisement_data(
+            "mlink-node",
+            Some("aabbccdd-eeff-1122-3344-556677889900"),
+        );
+        assert!(with_app.is_ok(), "expected Ok with valid app_uuid");
+
+        let without_app = build_advertisement_data("mlink-node", None);
+        assert!(without_app.is_ok(), "expected Ok with no app_uuid");
+
+        let malformed = build_advertisement_data("mlink-node", Some("not-a-uuid"));
+        assert!(
+            malformed.is_ok(),
+            "malformed app_uuid must fall back to single-UUID ad, not error"
+        );
     }
 
     #[test]

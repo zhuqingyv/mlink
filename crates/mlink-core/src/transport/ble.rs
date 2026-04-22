@@ -34,8 +34,60 @@ pub const CTRL_CHAR_UUID: Uuid = match Uuid::try_parse("0000FFAD-0000-1000-8000-
     Err(_) => panic!("invalid CTRL_CHAR_UUID literal"),
 };
 
+/// 4-byte marker that identifies the secondary service UUID carrying the
+/// advertiser's 8-byte app identity. Scanners look for this prefix in
+/// `props.services`, both sides compare identities to decide central/peripheral
+/// role before dialling (larger identity dials, smaller waits) — this avoids
+/// the symmetric-dial race where two Macs both call `connect()` and collide at
+/// the BLE physical layer.
+pub const IDENTITY_UUID_MARKER: [u8; 4] = [0x00, 0x00, 0xFF, 0xBB];
+
 const DEFAULT_MTU: usize = 512;
 const DEFAULT_SCAN_DURATION: Duration = Duration::from_secs(3);
+
+/// Encode the first 8 bytes of an app UUID string into a 128-bit service UUID.
+/// Layout: `[0x00,0x00,0xFF,0xBB] + app_uuid_bytes[0..8] + [0x00,0x00,0x00,0x00]`
+/// — a stable, round-trippable Uuid that carries identity in the middle 8
+/// bytes and can be rebuilt on the scanner side.
+pub fn encode_identity_uuid(app_uuid: &str) -> Option<Uuid> {
+    let parsed = Uuid::parse_str(app_uuid).ok()?;
+    let src = parsed.as_bytes();
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&IDENTITY_UUID_MARKER);
+    out[4..12].copy_from_slice(&src[0..8]);
+    // out[12..16] stays zero.
+    Some(Uuid::from_bytes(out))
+}
+
+/// Inverse of `encode_identity_uuid`. Returns the embedded 8-byte identity if
+/// `uuid` carries the `0000FFBB` marker in its first four bytes, otherwise
+/// `None`. Used by the scanner to lift a peer's identity out of
+/// `props.services`.
+pub fn decode_identity_uuid(uuid: &Uuid) -> Option<[u8; 8]> {
+    let bytes = uuid.as_bytes();
+    if bytes[0..4] != IDENTITY_UUID_MARKER {
+        return None;
+    }
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&bytes[4..12]);
+    Some(out)
+}
+
+/// Given our own app_uuid and a peer's advertised 8-byte identity, decide
+/// whether we should act as the BLE central (dial) or peripheral (wait).
+/// Returns `Some(true)` = we dial, `Some(false)` = we wait. Ties and
+/// unparsable local UUIDs return `None` so callers can fall back to the old
+/// symmetric-dial path (the only way we'd tie is if two nodes share an
+/// app_uuid — recoverable by retry but not by role arbitration).
+pub fn should_dial_as_central(local_app_uuid: &str, peer_identity: &[u8; 8]) -> Option<bool> {
+    let parsed = Uuid::parse_str(local_app_uuid).ok()?;
+    let local_first_8 = &parsed.as_bytes()[0..8];
+    match local_first_8.cmp(&peer_identity[..]) {
+        std::cmp::Ordering::Greater => Some(true),
+        std::cmp::Ordering::Less => Some(false),
+        std::cmp::Ordering::Equal => None,
+    }
+}
 
 pub struct BleTransport {
     adapter: Option<Adapter>,
@@ -43,6 +95,11 @@ pub struct BleTransport {
     scan_duration: Duration,
     local_name: String,
     room_hash: Option<[u8; 8]>,
+    /// Our own app_uuid, mirrored into the peripheral advertisement as a
+    /// second service UUID so scanning peers can deterministically pick a
+    /// central/peripheral role before dialling. `None` = fall back to the
+    /// single-UUID advertisement.
+    app_uuid: Option<String>,
 }
 
 impl BleTransport {
@@ -53,6 +110,7 @@ impl BleTransport {
             scan_duration: DEFAULT_SCAN_DURATION,
             local_name: "mlink".into(),
             room_hash: None,
+            app_uuid: None,
         }
     }
 
@@ -84,6 +142,16 @@ impl BleTransport {
         self.room_hash.as_ref()
     }
 
+    /// Set our app_uuid so peripheral advertisements carry an identity service
+    /// UUID and scanners on other nodes can pick a role deterministically.
+    pub fn set_app_uuid(&mut self, uuid: impl Into<String>) {
+        self.app_uuid = Some(uuid.into());
+    }
+
+    pub fn app_uuid(&self) -> Option<&str> {
+        self.app_uuid.as_deref()
+    }
+
     /// Start peripheral advertising and return the `MacPeripheral` handle so
     /// the caller can loop on `wait_for_central()` to accept multiple centrals.
     /// `listen()` only returns a single `Connection` and is kept for the
@@ -94,7 +162,12 @@ impl BleTransport {
         &mut self,
     ) -> Result<std::sync::Arc<super::peripheral::MacPeripheral>> {
         use super::peripheral::MacPeripheral;
-        let peripheral = MacPeripheral::start(self.local_name.clone(), self.room_hash).await?;
+        let peripheral = MacPeripheral::start(
+            self.local_name.clone(),
+            self.room_hash,
+            self.app_uuid.clone(),
+        )
+        .await?;
         Ok(std::sync::Arc::new(peripheral))
     }
 
@@ -160,18 +233,28 @@ impl Transport for BleTransport {
                 }
             };
             let raw_name = props.local_name.clone().unwrap_or_default();
-            // Try to lift a room hash out of the local name; if that fails,
-            // fall back to manufacturer_data so the peer still shows up and
-            // the caller can decide what to do with it.
-            let (name, metadata) = match parse_room_hash_from_name(&raw_name) {
-                Some((base, hash)) => (base, hash.to_vec()),
-                None => {
-                    let manuf_bytes: Vec<u8> = props
-                        .manufacturer_data
-                        .values()
-                        .flat_map(|v| v.iter().copied())
-                        .collect();
-                    (raw_name.clone(), manuf_bytes)
+            // Prefer the peer's 8-byte app identity encoded into the second
+            // service UUID (0000FFBB-...) — it lets the CLI pick a
+            // central/peripheral role without racing symmetric dials. Fall
+            // back to the old local-name room-hash path, then to
+            // manufacturer_data, so older advertisers still surface.
+            let identity = props.services.iter().find_map(decode_identity_uuid);
+            let (name, metadata) = if let Some(id) = identity {
+                let base = parse_room_hash_from_name(&raw_name)
+                    .map(|(b, _)| b)
+                    .unwrap_or_else(|| raw_name.clone());
+                (base, id.to_vec())
+            } else {
+                match parse_room_hash_from_name(&raw_name) {
+                    Some((base, hash)) => (base, hash.to_vec()),
+                    None => {
+                        let manuf_bytes: Vec<u8> = props
+                            .manufacturer_data
+                            .values()
+                            .flat_map(|v| v.iter().copied())
+                            .collect();
+                        (raw_name.clone(), manuf_bytes)
+                    }
                 }
             };
             eprintln!(
@@ -262,7 +345,12 @@ impl Transport for BleTransport {
         {
             use super::peripheral::{MacPeripheral, MacPeripheralConnection};
 
-            let peripheral = MacPeripheral::start(self.local_name.clone(), self.room_hash).await?;
+            let peripheral = MacPeripheral::start(
+                self.local_name.clone(),
+                self.room_hash,
+                self.app_uuid.clone(),
+            )
+            .await?;
             let peripheral = std::sync::Arc::new(peripheral);
             let (central_id, rx) = peripheral.wait_for_central().await?;
             let conn = MacPeripheralConnection::new(central_id, peripheral, rx);
@@ -472,5 +560,66 @@ mod tests {
         // A name that legitimately contains `#` still parses the trailing hex.
         let (base, _) = parse_room_hash_from_name("foo#bar#0011223344556677").unwrap();
         assert_eq!(base, "foo#bar");
+    }
+
+    #[test]
+    fn identity_uuid_encode_decode_roundtrip() {
+        let app_uuid = "aabbccdd-eeff-1122-3344-556677889900";
+        let encoded = encode_identity_uuid(app_uuid).expect("valid uuid");
+        // The first four bytes must match the shared marker so scanners can
+        // distinguish the identity UUID from MLINK_SERVICE_UUID.
+        assert_eq!(&encoded.as_bytes()[0..4], &IDENTITY_UUID_MARKER);
+        let decoded = decode_identity_uuid(&encoded).expect("marker present");
+        let expected: [u8; 8] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22];
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn identity_uuid_decode_rejects_non_marker_uuid() {
+        // MLINK_SERVICE_UUID (starts 0000FFAA) must not be mistaken for an
+        // identity UUID — otherwise scanners would pick up the wrong 8 bytes
+        // and pick the wrong role.
+        assert!(decode_identity_uuid(&MLINK_SERVICE_UUID).is_none());
+    }
+
+    #[test]
+    fn identity_uuid_encode_rejects_invalid_app_uuid() {
+        assert!(encode_identity_uuid("not-a-uuid").is_none());
+    }
+
+    #[test]
+    fn should_dial_as_central_orders_by_uuid_bytes() {
+        // Local UUID first 8 bytes > peer identity -> we dial.
+        let local = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        let peer: [u8; 8] = [0x00; 8];
+        assert_eq!(should_dial_as_central(local, &peer), Some(true));
+
+        // Local first 8 bytes < peer -> we wait.
+        let local_small = "00000000-0000-0000-ffff-ffffffffffff";
+        let peer_big: [u8; 8] = [0xff; 8];
+        assert_eq!(should_dial_as_central(local_small, &peer_big), Some(false));
+    }
+
+    #[test]
+    fn should_dial_as_central_returns_none_on_tie() {
+        // Same 8 bytes on both sides — can't arbitrate, fall back.
+        let local = "aabbccdd-eeff-1122-3344-556677889900";
+        let peer_id: [u8; 8] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22];
+        assert_eq!(should_dial_as_central(local, &peer_id), None);
+    }
+
+    #[test]
+    fn should_dial_as_central_returns_none_for_invalid_local() {
+        let peer: [u8; 8] = [0; 8];
+        assert_eq!(should_dial_as_central("not-a-uuid", &peer), None);
+    }
+
+    #[test]
+    fn encode_is_deterministic_same_input_same_uuid() {
+        // Two calls with the same app_uuid must return the same service UUID,
+        // otherwise our own advertisement would drift round-to-round and
+        // confuse peers.
+        let u = "01234567-89ab-cdef-fedc-ba9876543210";
+        assert_eq!(encode_identity_uuid(u), encode_identity_uuid(u));
     }
 }
