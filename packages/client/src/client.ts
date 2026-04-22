@@ -40,6 +40,31 @@ function resolveWSImpl(): WSCtor {
   return (mod.WebSocket ?? mod.default ?? mod) as WSCtor;
 }
 
+function parsePortFromUrl(url: string): number {
+  // Extract the port out of a ws:// or wss:// URL. WHATWG URL normalises
+  // default-port removal (80 for ws, 443 for wss), so fall back to those
+  // when `port` comes back empty.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`MlinkClient: invalid url '${url}'`);
+  }
+  if (parsed.port) {
+    const n = Number(parsed.port);
+    if (Number.isFinite(n) && n > 0) {
+      return n;
+    }
+  }
+  if (parsed.protocol === "wss:" || parsed.protocol === "https:") {
+    return 443;
+  }
+  if (parsed.protocol === "ws:" || parsed.protocol === "http:") {
+    return 80;
+  }
+  throw new Error(`MlinkClient: cannot derive port from url '${url}'`);
+}
+
 function readDaemonInfo(overridePath?: string): { port: number } {
   // Browser guard — the caller must provide `url` there.
   const isNode =
@@ -95,6 +120,7 @@ export interface MlinkClient {
  */
 export class MlinkClient extends EventEmitter {
   private readonly url: string;
+  private readonly _port: number;
   private readonly clientName?: string;
   private readonly pingIntervalMs: number;
   private readonly requestTimeoutMs: number;
@@ -123,9 +149,11 @@ export class MlinkClient extends EventEmitter {
     this.on("error", () => {});
     if (options.url) {
       this.url = options.url;
+      this._port = parsePortFromUrl(options.url);
     } else {
       const { port } = readDaemonInfo(options.daemonInfoPath);
       this.url = `ws://127.0.0.1:${port}/ws`;
+      this._port = port;
     }
     this.clientName = options.clientName;
     this.pingIntervalMs = options.pingIntervalMs ?? 30_000;
@@ -136,6 +164,15 @@ export class MlinkClient extends EventEmitter {
 
   get appUuid(): string {
     return this._appUuid;
+  }
+
+  /**
+   * Daemon port this client is pointed at. Resolved at construction time
+   * from either the explicit `url` option or `~/.mlink/daemon.json`. Stable
+   * for the lifetime of the instance.
+   */
+  get port(): number {
+    return this._port;
   }
 
   get rooms(): string[] {

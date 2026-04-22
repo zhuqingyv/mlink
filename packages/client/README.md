@@ -50,6 +50,7 @@ await client.send("123456", { text: "hello" });
 ### Properties
 
 - `appUuid: string` — this daemon's app_uuid (available after `ready`).
+- `port: number` — daemon port the client is pointed at. Resolved from `daemon.json` or the `url` option at construction time.
 - `rooms: string[]` — currently joined rooms.
 
 ### Events
