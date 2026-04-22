@@ -333,12 +333,12 @@ impl Transport for BleTransport {
             })?;
         eprintln!("[mlink:conn] ble.connect TX+RX chars found peer={peer_id}");
 
+        let notifications = peripheral.notifications().await?;
         if let Err(e) = peripheral.subscribe(&rx_char).await {
             eprintln!("[mlink:conn] ble.connect subscribe(RX) FAILED peer={peer_id}: {e}");
             return Err(e.into());
         }
         eprintln!("[mlink:conn] ble.connect subscribe(RX) OK peer={peer_id}");
-        let notifications = peripheral.notifications().await?;
 
         Ok(Box::new(BleConnection {
             peer_id,
