@@ -268,9 +268,11 @@ async fn test_node_config() {
     assert!(!node.config().encrypt);
     assert_eq!(node.config().trust_store_path.as_ref(), Some(&trust_path));
 
-    // NodeConfig::default() should have encrypt=true
+    // NodeConfig::default() must have encrypt=false — without an aes_key
+    // there is nothing to encrypt with, so claiming encrypt=true on the wire
+    // would be a lie (the original bug this was pinning in place).
     let d = NodeConfig::default();
-    assert!(d.encrypt);
+    assert!(!d.encrypt);
     assert!(d.trust_store_path.is_none());
     assert!(d.name.is_empty());
 }

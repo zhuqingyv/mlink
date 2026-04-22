@@ -43,7 +43,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             name: String::new(),
-            encrypt: true,
+            encrypt: false,
             trust_store_path: None,
         }
     }
@@ -225,7 +225,11 @@ impl Node {
             version: PROTOCOL_VERSION,
             mtu: transport.mtu() as u16,
             compress: true,
-            encrypt: self.config.encrypt,
+            // Advertise the *true* encryption state: we hold no session key at
+            // handshake time, so encryption is not yet active. Matching
+            // send_raw's actual behavior keeps the peer from trying to
+            // decrypt plaintext.
+            encrypt: false,
             last_seq: 0,
             resume_streams: vec![],
             room_hash: self.room_hash,
@@ -344,7 +348,7 @@ impl Node {
             version: PROTOCOL_VERSION,
             mtu: 512,
             compress: true,
-            encrypt: self.config.encrypt,
+            encrypt: false,
             last_seq: 0,
             resume_streams: vec![],
             room_hash: self.room_hash,
@@ -484,7 +488,7 @@ impl Node {
         msg_type: MessageType,
         payload: &[u8],
     ) -> Result<()> {
-        let (seq, compressed_flag, body) = {
+        let (seq, compressed_flag, encrypted_flag, body) = {
             let mut states = self.peer_states.write().await;
             let st = states.get_mut(peer_id).ok_or_else(|| MlinkError::PeerGone {
                 peer_id: peer_id.to_string(),
@@ -500,15 +504,22 @@ impl Node {
                 false
             };
 
-            if self.config.encrypt {
+            // Only claim "encrypted" on the wire when encryption is both
+            // requested AND a session key exists. Otherwise the flag is a lie
+            // and the peer will try to decrypt plaintext.
+            let encrypted_flag = if self.config.encrypt {
                 if let Some(key) = &st.aes_key {
                     body = crate::core::security::encrypt(&body, key, seq)?;
+                    true
+                } else {
+                    false
                 }
-            }
-            (seq, compressed_flag, body)
+            } else {
+                false
+            };
+            (seq, compressed_flag, encrypted_flag, body)
         };
 
-        let encrypted_flag = self.config.encrypt;
         let length = u16::try_from(body.len()).map_err(|_| MlinkError::PayloadTooLarge {
             size: body.len(),
             max: u16::MAX as usize,
@@ -884,9 +895,11 @@ mod tests {
     }
 
     #[test]
-    fn node_config_default_encrypt_true() {
+    fn node_config_default_encrypt_false() {
+        // Default must be false: we hold no aes_key at construction time,
+        // so claiming encrypt=true on the wire would be a lie.
         let c = NodeConfig::default();
-        assert!(c.encrypt);
+        assert!(!c.encrypt);
         assert!(c.trust_store_path.is_none());
     }
 
