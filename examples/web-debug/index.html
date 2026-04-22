@@ -512,6 +512,20 @@
   function handleRoomState(p) {
     const code = p.room || p.code;
     if (!code) return;
+    // `joined: false` is the daemon's ack that this session has left the room.
+    // Collapse the local state to match — never re-create a room here, or the
+    // optimistic `leaveRoom` delete gets silently undone by this frame.
+    if (p.joined === false) {
+      if (!rooms.has(code)) return;
+      rooms.delete(code);
+      if (currentRoom === code) {
+        const next = rooms.keys().next().value || null;
+        setCurrentRoom(next);
+      } else {
+        renderRooms();
+      }
+      return;
+    }
     if (!rooms.has(code)) rooms.set(code, { peers: new Map() });
     const r = rooms.get(code);
     r.peers.clear();
