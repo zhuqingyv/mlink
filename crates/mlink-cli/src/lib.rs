@@ -114,6 +114,10 @@ pub enum Commands {
     },
     /// Diagnose BLE adapter and environment
     Doctor,
+    /// Run the long-lived mlink daemon (WebSocket server on 127.0.0.1).
+    /// Writes `~/.mlink/daemon.json` with the bound port + pid; refuses to
+    /// start if a previous daemon is still alive.
+    Daemon,
 }
 
 #[derive(Subcommand, Debug)]

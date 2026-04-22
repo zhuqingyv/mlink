@@ -1,0 +1,29 @@
+[package]
+name = "mlink-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mlink-daemon"
+path = "src/main.rs"
+
+[lib]
+name = "mlink_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+mlink-core = { path = "../mlink-core" }
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "2"
+futures = "0.3"
+libc = "0.2"
+dirs = "5"
+
+[dev-dependencies]
+tokio-tungstenite = "0.23"
+futures-util = "0.3"

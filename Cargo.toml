@@ -2,5 +2,6 @@
 members = [
     "crates/mlink-core",
     "crates/mlink-cli",
+    "crates/mlink-daemon",
 ]
 resolver = "2"

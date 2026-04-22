@@ -24,6 +24,20 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
+    // `mlink daemon` wants graceful shutdown so it can clean up
+    // `~/.mlink/daemon.json` — the outer `_exit(0)` path below would skip that.
+    // Dispatch straight to `mlink_daemon::run()`, which owns its own ctrl-c
+    // select and runs `remove_daemon_info` before returning.
+    if matches!(cli.command, Some(Commands::Daemon)) {
+        return match mlink_daemon::run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: daemon: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Outer Ctrl+C guard. Long-running subcommands (serve/chat/join) each have
     // their own `select!` on `signal::ctrl_c()` for a graceful goodbye, but a
     // handful of paths in the transport layer can wedge cancellation — the BLE
@@ -84,6 +98,7 @@ async fn run(cli: Cli) -> Result<(), MlinkError> {
         Some(Commands::Status) => cmd_status().await,
         Some(Commands::Trust { action }) => cmd_trust(action).await,
         Some(Commands::Doctor) => cmd_doctor(kind).await,
+        Some(Commands::Daemon) => cmd_daemon().await,
 
         // No subcommand → one-shot "join or create a room" mode.
         None => {
@@ -1529,6 +1544,16 @@ async fn cmd_doctor(kind: TransportKind) -> Result<(), MlinkError> {
 
     println!("doctor: all checks passed");
     Ok(())
+}
+
+/// Run the long-lived daemon. Defers all the heavy lifting to
+/// `mlink_daemon::run()` which owns the Node, single-instance lock, and WS
+/// server. We just translate its error into `MlinkError::HandlerError` so the
+/// CLI's error printing path is uniform.
+async fn cmd_daemon() -> Result<(), MlinkError> {
+    mlink_daemon::run()
+        .await
+        .map_err(|e| MlinkError::HandlerError(format!("daemon: {e}")))
 }
 
 async fn tcp_loopback_check() -> Result<u16, MlinkError> {
