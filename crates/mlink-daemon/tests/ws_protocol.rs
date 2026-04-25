@@ -377,7 +377,15 @@ async fn explicit_leave_without_other_subscribers_retires_room() {
 /// (or `None` if the daemon hasn't joined any room yet), so the handshake
 /// passes the room-intersection check regardless of when the caller joined.
 async fn attach_handshaked_peer(state: &DaemonState) -> String {
-    use mlink_core::core::connection::perform_handshake;
+    attach_handshaked_peer_with_conn(state).await.0
+}
+
+/// Like `attach_handshaked_peer`, but also hands back the peer-side mock
+/// connection so the caller can read the frames the daemon writes to it.
+/// Used by the `send` broadcast/unicast tests to assert actual delivery.
+async fn attach_handshaked_peer_with_conn(
+    state: &DaemonState,
+) -> (String, mlink_core::transport::mock::MockConnection) {
     use mlink_core::core::peer::generate_app_uuid;
     use mlink_core::protocol::types::{Handshake, PROTOCOL_VERSION};
     use mlink_core::transport::mock::mock_pair;
@@ -395,17 +403,66 @@ async fn attach_handshaked_peer(state: &DaemonState) -> String {
         resume_streams: vec![],
         room_hash,
     };
-    let driver = tokio::spawn(async move {
-        let _ = perform_handshake(&cb, &hs).await;
-    });
+    // Drive the peer side of the handshake in-place: write our Handshake
+    // frame, read the daemon's reply, then hand `cb` back to the caller so
+    // later `Message` frames can still be read off it. We can't use
+    // `perform_handshake` here because it takes `&Connection` by reference
+    // and a spawned task would need to own `cb`.
+    use mlink_core::protocol::codec;
+    use mlink_core::protocol::frame::{decode_frame, encode_frame as encode_wire};
+    use mlink_core::protocol::types::{encode_flags, Frame, MessageType, MAGIC};
+    use mlink_core::transport::Connection as _;
+    let payload = codec::encode(&hs).expect("encode hs");
+    let hs_frame = Frame {
+        magic: MAGIC,
+        version: PROTOCOL_VERSION,
+        flags: encode_flags(false, false, MessageType::Handshake),
+        seq: 0,
+        length: payload.len() as u16,
+        payload,
+    };
+    let hs_bytes = encode_wire(&hs_frame);
+    let driver = {
+        let app_uuid = peer_app_uuid.clone();
+        tokio::spawn(async move {
+            cb.write(&hs_bytes).await.expect("cb write hs");
+            let reply = cb.read().await.expect("cb read daemon hs");
+            let decoded = decode_frame(&reply).expect("decode daemon hs");
+            let (_, _, mt) = mlink_core::protocol::types::decode_flags(decoded.flags);
+            assert_eq!(mt, MessageType::Handshake, "{app_uuid}: expected Handshake reply");
+            cb
+        })
+    };
     let id = state
         .node
         .accept_incoming(Box::new(ca), "mock", "mock-peer".into())
         .await
         .expect("accept_incoming");
-    driver.await.expect("driver joined");
+    let cb = driver.await.expect("driver joined");
     assert_eq!(id, peer_app_uuid);
-    peer_app_uuid
+    (peer_app_uuid, cb)
+}
+
+/// Read a `Message` frame from a peer-side mock connection and return the
+/// decoded payload bytes. Asserts the frame is actually a `Message` and not
+/// e.g. a Heartbeat. Payload is expected to be plaintext because the
+/// daemon's `accept_incoming` handshake advertises encrypt=false.
+async fn read_message_payload(
+    conn: &mlink_core::transport::mock::MockConnection,
+) -> Vec<u8> {
+    use mlink_core::protocol::frame::decode_frame;
+    use mlink_core::protocol::types::{decode_flags, MessageType};
+    use mlink_core::transport::Connection as _;
+    let bytes = tokio::time::timeout(Duration::from_secs(3), conn.read())
+        .await
+        .expect("timeout reading peer frame")
+        .expect("peer read");
+    let frame = decode_frame(&bytes).expect("decode frame");
+    let (compressed, encrypted, mt) = decode_flags(frame.flags);
+    assert_eq!(mt, MessageType::Message, "expected Message, got {mt:?}");
+    assert!(!compressed, "small payloads should not be compressed");
+    assert!(!encrypted, "handshake was encrypt=false, frames must be plaintext");
+    frame.payload
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -561,4 +618,122 @@ async fn join_drains_backlog_from_queue() {
     // Second `join` by the same client must not re-deliver the backlog —
     // drain left the bucket empty.
     assert_eq!(state.queue.lock().unwrap().len("424242"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_broadcasts_to_all_peers_and_acks_sender() {
+    // Happy path for the `send` handler without a `to` field: with two
+    // handshaked peers attached, the daemon must write a Message frame to
+    // BOTH peers and return an ack to the WS client that issued `send`.
+    // Regression guard for the fan-out loop in handle_send.
+    let (mut ws, state) = connect_with_state().await;
+
+    // Join first so both the sub check passes and the peers' handshakes
+    // carry the right room_hash.
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"818181"}}),
+    )
+    .await;
+    let _ack = read_json(&mut ws).await;
+    let _rs = read_json(&mut ws).await;
+
+    let (peer_a_id, peer_a_conn) = attach_handshaked_peer_with_conn(&state).await;
+    let (peer_b_id, peer_b_conn) = attach_handshaked_peer_with_conn(&state).await;
+
+    // Drain any PeerConnected-driven room_state pushes that arrive on the
+    // WS before our `send` reply lands.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    send_json(
+        &mut ws,
+        json!({
+            "v":1, "id":"s-bcast", "type":"send",
+            "payload":{"room":"818181", "payload":{"hello":"all"}}
+        }),
+    )
+    .await;
+
+    // Both peer-side mocks must see the Message frame with our JSON payload.
+    for conn in [&peer_a_conn, &peer_b_conn] {
+        let payload_bytes = read_message_payload(conn).await;
+        let v: Value = serde_json::from_slice(&payload_bytes).expect("json payload");
+        assert_eq!(v, json!({"hello":"all"}));
+    }
+
+    // The sender should see an ack for the send request. Skip any
+    // room_state frames that may have been queued before the ack.
+    let mut saw_ack = false;
+    for _ in 0..6 {
+        let frame = read_json(&mut ws).await;
+        if frame["type"] == "ack" && frame["id"] == "s-bcast" {
+            assert_eq!(frame["payload"]["type"], "send");
+            saw_ack = true;
+            break;
+        }
+    }
+    assert!(saw_ack, "expected ack for broadcast send");
+    // Sanity: both peers still registered (no accidental disconnect).
+    let ids: Vec<String> = state.node.peers().await.into_iter().map(|p| p.id).collect();
+    assert!(ids.contains(&peer_a_id) && ids.contains(&peer_b_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_to_specific_peer_unicasts_only_to_target() {
+    // `send` with a `to` field must deliver to exactly that peer — the
+    // other attached peer must not see any frame. Guards against the
+    // trivial bug of falling back to broadcast when `to` is set.
+    let (mut ws, state) = connect_with_state().await;
+
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"j", "type":"join", "payload":{"room":"919191"}}),
+    )
+    .await;
+    let _ack = read_json(&mut ws).await;
+    let _rs = read_json(&mut ws).await;
+
+    let (peer_a_id, peer_a_conn) = attach_handshaked_peer_with_conn(&state).await;
+    let (_peer_b_id, peer_b_conn) = attach_handshaked_peer_with_conn(&state).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    send_json(
+        &mut ws,
+        json!({
+            "v":1, "id":"s-unicast", "type":"send",
+            "payload":{"room":"919191", "to": peer_a_id, "payload":{"only":"a"}}
+        }),
+    )
+    .await;
+
+    // Target peer A must receive exactly the payload.
+    let payload_bytes = read_message_payload(&peer_a_conn).await;
+    let v: Value = serde_json::from_slice(&payload_bytes).expect("json payload");
+    assert_eq!(v, json!({"only":"a"}));
+
+    // Non-target peer B must see nothing within a sensible window.
+    use mlink_core::transport::Connection as _;
+    let silent = tokio::time::timeout(Duration::from_millis(150), peer_b_conn.read()).await;
+    assert!(
+        silent.is_err(),
+        "peer B must not receive a unicast addressed to peer A, got: {silent:?}"
+    );
+}
+
+#[tokio::test]
+async fn hello_with_non_object_payload_returns_bad_payload() {
+    // `hello.payload` must be an object (HelloPayload), so a JSON string
+    // fails deserialization and the handler must emit a `bad_payload`
+    // error instead of panicking or silently accepting. Covers the
+    // handle_hello error path that was previously untested.
+    let mut ws = connect().await;
+    send_json(
+        &mut ws,
+        json!({"v":1, "id":"h", "type":"hello", "payload":"not-an-object"}),
+    )
+    .await;
+    let err = read_json(&mut ws).await;
+    assert_eq!(err["type"], "error");
+    assert_eq!(err["payload"]["code"], "bad_payload");
+    assert_eq!(err["payload"]["id"], "h");
 }

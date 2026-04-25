@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+pub mod conn_tracker;
+pub mod role;
+
 /// Link-layer selector for the `--transport` flag. Kept in the library crate
 /// so both the binary and integration tests can exercise the string→enum
 /// parse logic without shelling out.
