@@ -76,6 +76,20 @@ async fn read_json(ws: &mut Ws) -> Value {
     serde_json::from_str(&text).expect("valid json")
 }
 
+/// Read frames off `ws` until one of type `want` arrives. Skips transport-
+/// debug frames (`link_added` / `link_removed` / `primary_changed` etc.) that
+/// may race ahead of the expected reply — those are validated by their own
+/// dedicated tests.
+async fn read_json_of_type(ws: &mut Ws, want: &str) -> Value {
+    for _ in 0..16 {
+        let frame = read_json(ws).await;
+        if frame["type"] == want {
+            return frame;
+        }
+    }
+    panic!("did not see a frame of type {want} within 16 frames");
+}
+
 #[tokio::test]
 async fn hello_echoes_ready_and_acks_when_id_present() {
     let mut ws = connect().await;
@@ -402,6 +416,8 @@ async fn attach_handshaked_peer_with_conn(
         last_seq: 0,
         resume_streams: vec![],
         room_hash,
+        session_id: None,
+        session_last_seq: 0,
     };
     // Drive the peer side of the handshake in-place: write our Handshake
     // frame, read the daemon's reply, then hand `cb` back to the caller so
@@ -484,13 +500,15 @@ async fn join_returns_connected_peers_in_room_state() {
         json!({"v":1, "id":"j", "type":"join", "payload":{"room":"515151"}}),
     )
     .await;
-    let ack = read_json(&mut ws).await;
+    // `link_added` (and any other transport-debug frame) may race ahead of the
+    // join ack because the peer handshake above emits it. Skip past them.
+    let ack = read_json_of_type(&mut ws, "ack").await;
     assert_eq!(ack["type"], "ack");
 
     // PeerConnected may race ahead of our join — read frames until we find a
     // room_state for this room, then assert its peer list.
     let mut peers_found: Option<usize> = None;
-    for _ in 0..6 {
+    for _ in 0..8 {
         let frame = read_json(&mut ws).await;
         if frame["type"] != "room_state" {
             continue;
@@ -533,7 +551,8 @@ async fn peer_connected_event_pushes_room_state_with_peers() {
     attach_handshaked_peer(&state).await;
 
     // Session loop should observe PeerConnected and fan a fresh room_state.
-    let pushed = read_json(&mut ws).await;
+    // Transport-debug frames (link_added etc.) may race ahead; skip them.
+    let pushed = read_json_of_type(&mut ws, "room_state").await;
     assert_eq!(pushed["type"], "room_state");
     assert_eq!(pushed["payload"]["room"], "616161");
     assert_eq!(pushed["payload"]["joined"], true);
@@ -573,11 +592,14 @@ async fn peer_disconnected_event_pushes_updated_room_state() {
 
     state.node.disconnect_peer(&peer_id).await.expect("disconnect");
 
-    // Expect a room_state with peers = [] eventually.
+    // Expect a room_state with peers = [] eventually. Transport-debug frames
+    // (`link_removed`) may race ahead of the room_state — skip them.
     let mut saw_empty = false;
-    for _ in 0..4 {
+    for _ in 0..8 {
         let frame = read_json(&mut ws).await;
-        assert_eq!(frame["type"], "room_state", "unexpected frame while waiting for empty peers");
+        if frame["type"] != "room_state" {
+            continue;
+        }
         if frame["payload"]["peers"].as_array().unwrap().is_empty() {
             saw_empty = true;
             break;

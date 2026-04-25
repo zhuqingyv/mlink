@@ -36,6 +36,9 @@ pub enum MlinkError {
     #[error("room mismatch with peer {peer_id}")]
     RoomMismatch { peer_id: String },
 
+    #[error("no healthy link for peer {peer_id}")]
+    NoHealthyLink { peer_id: String },
+
     #[error("ble error: {0}")]
     Ble(#[from] btleplug::Error),
 
@@ -96,6 +99,14 @@ mod tests {
             peer_id: "abc".into(),
         };
         assert_eq!(e.to_string(), "room mismatch with peer abc");
+    }
+
+    #[test]
+    fn no_healthy_link_display() {
+        let e = MlinkError::NoHealthyLink {
+            peer_id: "peer-xyz".into(),
+        };
+        assert_eq!(e.to_string(), "no healthy link for peer peer-xyz");
     }
 
     #[test]

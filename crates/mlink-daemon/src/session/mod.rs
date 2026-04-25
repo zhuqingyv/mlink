@@ -17,9 +17,13 @@ mod handlers;
 mod handlers_send;
 mod lifecycle;
 mod outbound;
+mod transport_debug;
+mod transport_forward;
+mod transport_list;
 mod validate;
 
 pub use lifecycle::run;
+pub use transport_forward::spawn_session_event_forwarder;
 
 /// Maximum accepted frame size, in bytes. Matches the product rule ("WS
 /// single message upper bound 1 MB"). Oversize frames are rejected with

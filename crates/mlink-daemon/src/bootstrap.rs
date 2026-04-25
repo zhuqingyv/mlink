@@ -159,15 +159,22 @@ pub async fn build_state() -> Result<DaemonState, DaemonError> {
     // Kick off discovery + accept in the background so every WS client shares
     // one scanner/peripheral pair. `DaemonTransport::from_env` is permissive —
     // an unknown value silently falls back to TCP (safe default for CI).
+    // `"dual"` brings up BLE and TCP side by side; the shared `Arc<Node>` lets
+    // SessionManager merge two inbound links for the same peer into one Session.
     discovery::spawn(Arc::clone(&node), discovery::DaemonTransport::from_env());
 
-    Ok(DaemonState {
+    let state = DaemonState {
         node,
         node_events: tx,
         sessions,
         rooms,
         queue,
-    })
+    };
+    // Re-publish SessionEvent::Switched / StreamProgress onto every WS session.
+    // LinkAdded / LinkRemoved are delivered via the NodeEvent path instead, so
+    // we don't double-render in the UI.
+    crate::session::spawn_session_event_forwarder(state.clone());
+    Ok(state)
 }
 
 /// Bind the listener, write the daemon-info file, and return the bound port

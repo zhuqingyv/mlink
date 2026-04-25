@@ -208,6 +208,8 @@ async fn accept_incoming_matching_room_registers_peer() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: Some(room),
+        session_id: None,
+        session_last_seq: 0,
     };
     let driver = tokio::spawn(async move {
         perform_handshake(&cb, &hs_b).await.expect("peer hs");
@@ -247,6 +249,8 @@ async fn accept_incoming_mismatched_room_rejects() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: bogus_room,
+        session_id: None,
+        session_last_seq: 0,
     };
     let driver = tokio::spawn(async move {
         // The peer will get either a handshake reply or a closed socket;
@@ -310,6 +314,8 @@ async fn node_in_multiple_rooms_accepts_peers_from_any_of_them() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: Some(room_b),
+        session_id: None,
+        session_last_seq: 0,
     };
     let driver = tokio::spawn(async move {
         perform_handshake(&cb, &hs_b).await.expect("peer hs");
@@ -350,6 +356,8 @@ async fn node_rejects_peer_whose_room_is_not_in_set() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: Some([0xCC; 8]),
+        session_id: None,
+        session_last_seq: 0,
     };
     let driver = tokio::spawn(async move {
         let _ = perform_handshake(&cb, &hs_b).await;
@@ -431,6 +439,8 @@ async fn accept_incoming_is_idempotent_when_already_connected() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: None,
+        session_id: None,
+        session_last_seq: 0,
     };
     let driver = tokio::spawn(async move {
         let _ = perform_handshake(&cb, &hs_b).await;
@@ -774,6 +784,8 @@ async fn connect_peer_matching_room_happy_path() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: Some(room),
+        session_id: None,
+        session_last_seq: 0,
     };
 
     // The peer keeps the cb end alive through an Arc so we can reuse it
@@ -887,6 +899,8 @@ async fn connect_peer_dedup_when_already_connected() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: None,
+        session_id: None,
+        session_last_seq: 0,
     };
     let driver = tokio::spawn(async move {
         let _ = perform_handshake(&cb, &hs_b).await;
@@ -940,6 +954,8 @@ async fn connect_peer_rejects_mismatched_room() {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: bogus_room,
+        session_id: None,
+        session_last_seq: 0,
     };
     let driver = tokio::spawn(async move {
         // The peer may observe a closed socket as soon as node_a rejects,

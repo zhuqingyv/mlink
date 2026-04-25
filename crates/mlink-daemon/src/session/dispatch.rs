@@ -3,6 +3,9 @@ use axum::extract::ws::WebSocket;
 use super::handlers::{handle_hello, handle_join, handle_leave, handle_ping};
 use super::handlers_send::handle_send;
 use super::outbound::send;
+use super::transport_debug::{
+    handle_disconnect_link, handle_transport_list, handle_transport_switch,
+};
 use crate::protocol::{codes, encode_frame, Envelope, ErrorPayload};
 use crate::{DaemonState, SessionHandle, WS_PROTOCOL_VERSION};
 
@@ -49,6 +52,13 @@ pub(super) async fn handle_text(
         "leave" => handle_leave(socket, state, handle, env.id.as_deref(), env.payload).await,
         "send" => handle_send(socket, state, handle, env.id.as_deref(), env.payload).await,
         "ping" => handle_ping(socket, env.id.as_deref()).await,
+        "transport_list" => handle_transport_list(socket, state, env.id.as_deref()).await,
+        "transport_switch" => {
+            handle_transport_switch(socket, state, env.id.as_deref(), env.payload).await
+        }
+        "disconnect_link" => {
+            handle_disconnect_link(socket, state, env.id.as_deref(), env.payload).await
+        }
         other => {
             send(
                 socket,

@@ -177,6 +177,8 @@ fn sample_handshake(uuid: &str) -> Handshake {
         last_seq: 0,
         resume_streams: vec![],
         room_hash: None,
+        session_id: None,
+        session_last_seq: 0,
     }
 }
 

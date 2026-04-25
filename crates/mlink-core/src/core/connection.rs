@@ -3,13 +3,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::core::link::{Link, TransportKind};
+use crate::core::session::manager::{AttachOutcome, SessionManager};
+use crate::core::session::types::{LinkStatus, SessionEvent, SwitchCause};
 use crate::protocol::codec;
 use crate::protocol::errors::{MlinkError, Result};
 use crate::protocol::frame::{decode_frame, encode_frame};
 use crate::protocol::types::{
     encode_flags, Frame, Handshake, MessageType, MAGIC, PROTOCOL_VERSION,
 };
-use crate::transport::Connection;
+use crate::transport::{Connection, TransportCapabilities};
 
 /// A connection shared between the `ConnectionManager` map and whatever task
 /// is currently driving read or write on it. `Connection` is `&self`-only, so
@@ -39,14 +42,30 @@ pub fn negotiate_role(my_uuid: &str, peer_uuid: &str) -> Role {
     }
 }
 
+/// Compat shell around `SessionManager` (W2-D). Sync API preserves the
+/// pre-dual-transport `Arc<Mutex<ConnectionManager>>` contract for legacy
+/// call sites / 450+ tests; async API forwards into `SessionManager`. Both
+/// stores co-exist during the transition — sync callers mutate only the
+/// HashMap, async callers drive the SessionManager.
 pub struct ConnectionManager {
     conns: HashMap<String, SharedConnection>,
+    sessions: Arc<SessionManager>,
 }
 
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             conns: HashMap::new(),
+            sessions: Arc::new(SessionManager::new()),
+        }
+    }
+
+    /// Reuse an existing `SessionManager` so Node can share one instance
+    /// between the compat shell and its own async paths.
+    pub fn with_sessions(sessions: Arc<SessionManager>) -> Self {
+        Self {
+            conns: HashMap::new(),
+            sessions,
         }
     }
 
@@ -58,10 +77,9 @@ impl ConnectionManager {
         self.conns.remove(id)
     }
 
-    /// Clone the shared handle for `id`, if any. Callers should hold the
-    /// outer map lock only long enough to clone — the actual read/write
-    /// runs against the returned Arc with the map lock released, so
-    /// a parked read cannot stall writes on the same or other peers.
+    /// Clone the shared handle for `id` if any. Callers must release the
+    /// outer Mutex immediately after the clone — the actual read/write
+    /// runs against the returned Arc with the map lock dropped.
     pub fn shared(&self, id: &str) -> Option<SharedConnection> {
         self.conns.get(id).cloned()
     }
@@ -77,6 +95,87 @@ impl ConnectionManager {
     pub fn count(&self) -> usize {
         self.conns.len()
     }
+
+    pub fn session_manager(&self) -> &Arc<SessionManager> {
+        &self.sessions
+    }
+
+    /// Async counterpart of `add`: wrap `conn` as a single-link Session so
+    /// Session-layer readers/senders can see the peer.
+    pub async fn attach_link_async(
+        &self,
+        id: &str,
+        conn: SharedConnection,
+        kind: TransportKind,
+        caps: TransportCapabilities,
+    ) -> AttachOutcome {
+        let link_id = format!("{}:{}:0", kind.as_wire(), short_peer(id));
+        let link = Link::new(link_id, conn, kind, caps);
+        self.sessions.attach_link(id, link, None).await
+    }
+
+    /// Attach a second (or Nth) link to an already-connected peer.
+    pub async fn attach_secondary_link(
+        &self,
+        peer_id: &str,
+        link: Link,
+        session_id_hint: Option<[u8; 16]>,
+    ) -> AttachOutcome {
+        self.sessions
+            .attach_link(peer_id, link, session_id_hint)
+            .await
+    }
+
+    pub async fn peer_link_status(&self, peer_id: &str) -> Vec<LinkStatus> {
+        self.sessions.peer_link_status(peer_id).await
+    }
+
+    /// Force `link_id` active on `peer_id`. Emits `Switched(ManualUserRequest)`
+    /// when the active link changes; `NoHealthyLink` on unknown peer/link.
+    pub async fn switch_active_link(&self, peer_id: &str, link_id: &str) -> Result<()> {
+        let session = self.sessions.get(peer_id).await.ok_or_else(|| {
+            MlinkError::NoHealthyLink {
+                peer_id: peer_id.to_string(),
+            }
+        })?;
+        let present = session
+            .links
+            .read()
+            .await
+            .iter()
+            .any(|l| l.id() == link_id);
+        if !present {
+            return Err(MlinkError::NoHealthyLink {
+                peer_id: peer_id.to_string(),
+            });
+        }
+        let prev = {
+            let mut active = session.active.write().await;
+            let prev = active.clone();
+            *active = Some(link_id.to_string());
+            prev
+        };
+        if prev.as_deref() != Some(link_id) {
+            let _ = session.events.send(SessionEvent::Switched {
+                peer_id: peer_id.to_string(),
+                from: prev.unwrap_or_default(),
+                to: link_id.to_string(),
+                cause: SwitchCause::ManualUserRequest,
+            });
+        }
+        Ok(())
+    }
+
+    /// Drop a peer from the SessionManager side (closes every link). Sync
+    /// HashMap is untouched — call `remove` to evict there too.
+    pub async fn drop_peer_async(&self, peer_id: &str) {
+        let _ = self.sessions.drop_peer(peer_id).await;
+    }
+}
+
+fn short_peer(id: &str) -> &str {
+    let cut = id.char_indices().nth(4).map(|(i, _)| i).unwrap_or(id.len());
+    &id[..cut]
 }
 
 impl Default for ConnectionManager {
@@ -279,6 +378,8 @@ mod tests {
             last_seq: 0,
             resume_streams: vec![],
             room_hash: None,
+            session_id: None,
+            session_last_seq: 0,
         }
     }
 
@@ -372,5 +473,154 @@ mod tests {
             .await
             .expect("hs");
         assert_eq!(got, peer_hs);
+    }
+
+    // ---- W2-D compat-shell: async bridge into SessionManager ----
+
+    fn default_caps() -> crate::transport::TransportCapabilities {
+        crate::transport::TransportCapabilities {
+            max_peers: 8,
+            throughput_bps: 1_000_000,
+            latency_ms: 10,
+            reliable: true,
+            bidirectional: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_link_async_creates_session_and_exposes_via_session_manager() {
+        let mgr = ConnectionManager::new();
+        let conn: SharedConnection = Arc::new(make_mock("peer-a"));
+        let outcome = mgr
+            .attach_link_async("peer-a", conn, crate::core::link::TransportKind::Tcp, default_caps())
+            .await;
+        assert!(matches!(
+            outcome,
+            crate::core::session::manager::AttachOutcome::CreatedNew { .. }
+        ));
+        assert!(mgr.session_manager().contains("peer-a").await);
+        let status = mgr.peer_link_status("peer-a").await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].kind, crate::core::link::TransportKind::Tcp);
+    }
+
+    #[tokio::test]
+    async fn attach_secondary_link_merges_when_session_id_matches() {
+        let mgr = ConnectionManager::new();
+        let primary: SharedConnection = Arc::new(make_mock("peer-b"));
+        let outcome = mgr
+            .attach_link_async("peer-b", primary, crate::core::link::TransportKind::Ble, default_caps())
+            .await;
+        let sid = match outcome {
+            crate::core::session::manager::AttachOutcome::CreatedNew { session_id } => session_id,
+            _ => panic!("expected CreatedNew"),
+        };
+        let second_conn: SharedConnection = Arc::new(make_mock("peer-b"));
+        let second = crate::core::link::Link::new(
+            "tcp:peer:1".into(),
+            second_conn,
+            crate::core::link::TransportKind::Tcp,
+            default_caps(),
+        );
+        let outcome = mgr.attach_secondary_link("peer-b", second, Some(sid)).await;
+        assert_eq!(
+            outcome,
+            crate::core::session::manager::AttachOutcome::AttachedExisting
+        );
+        let status = mgr.peer_link_status("peer-b").await;
+        assert_eq!(status.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn switch_active_link_emits_manual_switched_event() {
+        let mgr = ConnectionManager::new();
+        let primary: SharedConnection = Arc::new(make_mock("peer-c"));
+        mgr.attach_link_async(
+            "peer-c",
+            primary,
+            crate::core::link::TransportKind::Ble,
+            default_caps(),
+        )
+        .await;
+        // Attach a second link via the secondary path so we have a target to flip to.
+        let session = mgr.session_manager().get("peer-c").await.expect("session");
+        let sid = session.session_id;
+        let second_conn: SharedConnection = Arc::new(make_mock("peer-c"));
+        let second_link_id = "tcp:peer:1".to_string();
+        let second = crate::core::link::Link::new(
+            second_link_id.clone(),
+            second_conn,
+            crate::core::link::TransportKind::Tcp,
+            default_caps(),
+        );
+        mgr.attach_secondary_link("peer-c", second, Some(sid)).await;
+
+        let mut rx = session.events.subscribe();
+        mgr.switch_active_link("peer-c", &second_link_id)
+            .await
+            .expect("switch ok");
+        // Give the broadcast a moment
+        let ev = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("event in time")
+            .expect("event recv");
+        match ev {
+            crate::core::session::types::SessionEvent::Switched { to, cause, .. } => {
+                assert_eq!(to, second_link_id);
+                assert_eq!(
+                    cause,
+                    crate::core::session::types::SwitchCause::ManualUserRequest
+                );
+            }
+            other => panic!("expected Switched, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_active_link_rejects_unknown_peer_or_link() {
+        let mgr = ConnectionManager::new();
+        let err = mgr
+            .switch_active_link("nope", "tcp:xxx:0")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MlinkError::NoHealthyLink { .. }));
+
+        let conn: SharedConnection = Arc::new(make_mock("peer-d"));
+        mgr.attach_link_async(
+            "peer-d",
+            conn,
+            crate::core::link::TransportKind::Tcp,
+            default_caps(),
+        )
+        .await;
+        let err = mgr
+            .switch_active_link("peer-d", "wrong-link")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MlinkError::NoHealthyLink { .. }));
+    }
+
+    #[tokio::test]
+    async fn sync_and_async_paths_are_independent() {
+        // The sync HashMap and the SessionManager are separate stores; each
+        // path should only mutate its own side. This guards callers that
+        // only go through the sync shell from accidental SessionManager
+        // side-effects, and vice-versa.
+        let mut mgr = ConnectionManager::new();
+        mgr.add("sync-peer".into(), Arc::new(make_mock("sync-peer")));
+        assert!(mgr.contains("sync-peer"));
+        assert_eq!(mgr.count(), 1);
+        assert!(!mgr.session_manager().contains("sync-peer").await);
+
+        let async_conn: SharedConnection = Arc::new(make_mock("async-peer"));
+        mgr.attach_link_async(
+            "async-peer",
+            async_conn,
+            crate::core::link::TransportKind::Tcp,
+            default_caps(),
+        )
+        .await;
+        assert!(!mgr.contains("async-peer"));
+        assert!(mgr.session_manager().contains("async-peer").await);
     }
 }

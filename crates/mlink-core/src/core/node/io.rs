@@ -6,6 +6,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::{Node, NodeEvent, NodeState, PeerState, HEARTBEAT_TIMEOUT};
 use crate::core::connection::ConnectionManager;
+use crate::core::session::SessionManager;
 use crate::protocol::compress::{compress, decompress, should_compress};
 use crate::protocol::errors::{MlinkError, Result};
 use crate::protocol::frame::{decode_frame, encode_frame};
@@ -13,6 +14,60 @@ use crate::protocol::types::{decode_flags, encode_flags, Frame, MessageType, MAG
 
 impl Node {
     pub async fn send_raw(
+        &self,
+        peer_id: &str,
+        msg_type: MessageType,
+        payload: &[u8],
+    ) -> Result<()> {
+        // Dual-link peers must go through Session so ack/failover/dedup all
+        // line up across links. Single-link peers stay on the legacy direct
+        // write path — it preserves the exact byte layout on the wire that
+        // pre-dual-transport tests and clients assume (no u32 seq prefix).
+        if self.session_is_multilink(peer_id).await {
+            return self.send_via_session(peer_id, msg_type, payload).await;
+        }
+        self.send_legacy(peer_id, msg_type, payload).await
+    }
+
+    async fn session_is_multilink(&self, peer_id: &str) -> bool {
+        match self.sessions.get(peer_id).await {
+            Some(s) => s.links.read().await.len() >= 2,
+            None => false,
+        }
+    }
+
+    async fn send_via_session(
+        &self,
+        peer_id: &str,
+        msg_type: MessageType,
+        payload: &[u8],
+    ) -> Result<()> {
+        let session = self
+            .sessions
+            .get(peer_id)
+            .await
+            .ok_or_else(|| MlinkError::PeerGone {
+                peer_id: peer_id.to_string(),
+            })?;
+        let (encrypt_key, compress_on) = {
+            let states = self.peer_states.read().await;
+            let st = states.get(peer_id).ok_or_else(|| MlinkError::PeerGone {
+                peer_id: peer_id.to_string(),
+            })?;
+            let key = if self.config.encrypt {
+                st.aes_key.clone()
+            } else {
+                None
+            };
+            (key, true)
+        };
+        session
+            .send(msg_type, payload.to_vec(), encrypt_key.as_deref(), compress_on)
+            .await?;
+        Ok(())
+    }
+
+    async fn send_legacy(
         &self,
         peer_id: &str,
         msg_type: MessageType,
@@ -34,9 +89,6 @@ impl Node {
                 false
             };
 
-            // Only claim "encrypted" on the wire when encryption is both
-            // requested AND a session key exists. Otherwise the flag is a lie
-            // and the peer will try to decrypt plaintext.
             let encrypted_flag = if self.config.encrypt {
                 if let Some(key) = &st.aes_key {
                     body = crate::core::security::encrypt(&body, key, seq)?;
@@ -85,23 +137,28 @@ impl Node {
     /// emits `NodeEvent::PeerDisconnected` before returning. It does *not*
     /// attempt to reconnect — discovery owns that.
     ///
-    /// The cleanup matters because a reader that only emits the event (and
-    /// leaves the stale `Arc<dyn Connection>` in place) causes the next
-    /// `send_raw` to fail with "Broken pipe", and blocks a re-dial to the
-    /// same `app_uuid` via the dedup guard in `connect_peer`.
-    ///
-    /// Must be called after a successful `connect_peer` / `accept_incoming`
-    /// for that peer; otherwise the reader will immediately see `PeerGone`
-    /// and exit (still running the cleanup so nothing leaks).
+    /// When the peer has a multi-link session attached, the task routes reads
+    /// through `Session::recv` instead so the u32 session_seq / dedup / ack
+    /// machinery runs. Both modes converge on the same
+    /// `NodeEvent::MessageReceived` payload shape.
     pub fn spawn_peer_reader(&self, peer_id: String) -> tokio::task::JoinHandle<()> {
         let connections = Arc::clone(&self.connections);
+        let sessions = Arc::clone(&self.sessions);
         let peer_states = Arc::clone(&self.peer_states);
         let peer_manager = Arc::clone(&self.peer_manager);
-        let events_tx = self.events_tx.clone();
+        let events_tx = self.events_tx().clone();
         let encrypt = self.config.encrypt;
         tokio::spawn(async move {
             loop {
-                let res = recv_once(&connections, &peer_states, encrypt, &peer_id).await;
+                let use_session = match sessions.get(&peer_id).await {
+                    Some(s) => s.links.read().await.len() >= 2,
+                    None => false,
+                };
+                let res = if use_session {
+                    recv_once_session(&sessions, &peer_id).await
+                } else {
+                    recv_once(&connections, &peer_states, encrypt, &peer_id).await
+                };
                 match res {
                     Ok((msg_type, payload)) => {
                         if msg_type == MessageType::Message {
@@ -111,14 +168,14 @@ impl Node {
                             });
                         }
                         // Heartbeats and other control frames are consumed
-                        // silently — `recv_once` already refreshed the
+                        // silently — recv_once already refreshed the
                         // last-heartbeat timestamp.
                     }
                     Err(_) => {
-                        // Mirror `disconnect_peer`: evict conn, drop peer,
+                        // Mirror disconnect_peer: evict conn, drop peer,
                         // mark state Disconnected, fire the event. Done
                         // inline because this task only holds Arc handles,
-                        // not `&Node`.
+                        // not &Node.
                         let removed = {
                             let mut guard = connections.lock().await;
                             guard.remove(&peer_id)
@@ -126,6 +183,7 @@ impl Node {
                         if let Some(conn) = removed {
                             let _ = conn.close().await;
                         }
+                        let _ = sessions.drop_peer(&peer_id).await;
                         peer_manager.remove(&peer_id).await;
                         {
                             let mut states = peer_states.write().await;
@@ -246,4 +304,19 @@ async fn recv_once(
     }
 
     Ok((msg_type, payload))
+}
+
+/// Session-backed recv: pulls the next application Message off whichever link
+/// has data, honoring dedup + ack coalescing. Always returns `MessageType::Message`
+/// on success — control frames (ack, heartbeat, etc.) are consumed inside
+/// `Session::recv` and not surfaced.
+async fn recv_once_session(
+    sessions: &Arc<SessionManager>,
+    peer_id: &str,
+) -> Result<(MessageType, Vec<u8>)> {
+    let session = sessions.get(peer_id).await.ok_or_else(|| MlinkError::PeerGone {
+        peer_id: peer_id.to_string(),
+    })?;
+    let (_seq, payload) = session.recv().await?;
+    Ok((MessageType::Message, payload))
 }

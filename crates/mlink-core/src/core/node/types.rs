@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
+use crate::core::link::TransportKind;
 use crate::core::reconnect::ReconnectPolicy;
+use crate::core::session::types::SwitchCause;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -72,4 +74,23 @@ pub enum NodeEvent {
     /// connection is being drained by the background reader spawned by
     /// `Node::spawn_peer_reader`.
     MessageReceived { peer_id: String, payload: Vec<u8> },
+    /// A new physical link was attached to the peer's session.
+    LinkAdded {
+        peer_id: String,
+        link_id: String,
+        transport: TransportKind,
+    },
+    /// A link was detached (failure or manual).
+    LinkRemoved {
+        peer_id: String,
+        link_id: String,
+        reason: String,
+    },
+    /// The active link for the peer changed.
+    LinkSwitched {
+        peer_id: String,
+        from_link: String,
+        to_link: String,
+        cause: SwitchCause,
+    },
 }

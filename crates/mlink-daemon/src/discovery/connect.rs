@@ -1,182 +1,25 @@
-//! Background discovery loop. Started once at daemon boot so every WS client
-//! shares a single scanner + accept loop. Join/leave only toggles the set of
-//! room hashes the node validates against at handshake time — the scanner
-//! itself runs with no room filter so peers from every active room can be
-//! surfaced through the same transport.
-//!
-//! Transport selection is driven by `MLINK_DAEMON_TRANSPORT` (`tcp` default,
-//! `ble` when explicitly requested). TCP is the default because it works
-//! headlessly in CI and doesn't require macOS Core Bluetooth permissions.
+//! Transport-agnostic connect/accept driver shared by the TCP and BLE spawners.
+//! Handles dedup across already-engaged peers, retry budget, and the unsee
+//! signal the scanner needs to re-surface a peer after a failed dial.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use mlink_core::core::node::{Node, NodeEvent};
-use mlink_core::core::scanner::Scanner;
 use mlink_core::protocol::errors::MlinkError;
-use mlink_core::transport::tcp::TcpTransport;
 use mlink_core::transport::{Connection, DiscoveredPeer, Transport};
 use tokio::sync::mpsc;
-
-#[cfg(target_os = "macos")]
-use mlink_core::transport::ble::BleTransport;
-
-/// Choice of link-layer transport. Parsed from `MLINK_DAEMON_TRANSPORT` —
-/// anything other than a literal `"ble"` falls back to TCP so a typo doesn't
-/// silently boot a radio the user didn't ask for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DaemonTransport {
-    Tcp,
-    Ble,
-}
-
-impl DaemonTransport {
-    pub fn from_env() -> Self {
-        match std::env::var("MLINK_DAEMON_TRANSPORT").as_deref() {
-            Ok("ble") => DaemonTransport::Ble,
-            _ => DaemonTransport::Tcp,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            DaemonTransport::Tcp => "tcp",
-            DaemonTransport::Ble => "ble",
-        }
-    }
-}
 
 /// Outer timeout for dial / accept. Mirrors the CLI — long enough that a slow
 /// honest peer completes, short enough that a dead socket unwinds.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RETRIES: u8 = 3;
 
-/// Spawn the long-lived discovery + auto-connect loop. Returns immediately;
-/// the loop runs on tokio tasks for the lifetime of the process. Errors
-/// bubble up as tracing warnings — the daemon keeps serving WS regardless.
-pub fn spawn(node: Arc<Node>, transport: DaemonTransport) {
-    match transport {
-        DaemonTransport::Tcp => spawn_tcp(node),
-        DaemonTransport::Ble => spawn_ble(node),
-    }
-    tracing::info!(transport = transport.label(), "discovery loop started");
-}
-
-fn spawn_tcp(node: Arc<Node>) {
-    let local_name = node.config().name.clone();
-    let app_uuid = node.app_uuid().to_string();
-
-    // Peripheral (TCP listener + mDNS advertisement). No room filter — every
-    // joined room shares a single listener; handshake does the real filtering.
-    let (accepted_tx, accepted_rx) = mpsc::channel::<Box<dyn Connection>>(4);
-    let mut listen = TcpTransport::new();
-    listen.set_local_name(local_name.clone());
-    listen.set_app_uuid(app_uuid.clone());
-    tokio::spawn(async move {
-        loop {
-            match listen.listen().await {
-                Ok(conn) => {
-                    if accepted_tx.send(conn).await.is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "tcp accept failed");
-                    return;
-                }
-            }
-        }
-    });
-
-    // Scanner (no room filter).
-    let (peer_tx, peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
-    let (unsee_tx, unsee_rx) = mpsc::channel::<String>(16);
-    let mut scan = TcpTransport::new();
-    scan.set_app_uuid(app_uuid.clone());
-    let mut scanner = Scanner::new(Box::new(scan), app_uuid);
-    scanner.set_unsee_channel(unsee_rx);
-    tokio::spawn(async move {
-        if let Err(e) = scanner.discover_loop(peer_tx).await {
-            tracing::warn!(error = %e, "tcp scanner exited");
-        }
-    });
-
-    let connect = {
-        let mut t = TcpTransport::new();
-        t.set_app_uuid(node.app_uuid().to_string());
-        Box::new(t) as Box<dyn Transport>
-    };
-    tokio::spawn(connect_loop(node, connect, peer_rx, accepted_rx, unsee_tx, "tcp"));
-}
-
-fn spawn_ble(node: Arc<Node>) {
-    #[cfg(target_os = "macos")]
-    {
-        let local_name = node.config().name.clone();
-        let app_uuid = node.app_uuid().to_string();
-
-        let (accepted_tx, accepted_rx) = mpsc::channel::<Box<dyn Connection>>(4);
-        let mut listen = BleTransport::new();
-        listen.set_local_name(local_name);
-        listen.set_app_uuid(app_uuid.clone());
-        // No room_hash on the peripheral: the advertised service UUID encodes a
-        // room, so a daemon that joins multiple rooms would have to re-advertise
-        // on each `join`. Skip that complexity — peers advertising *their* room
-        // will still rendezvous because handshake verification runs on both ends.
-        tokio::spawn(async move {
-            let peripheral = match listen.start_peripheral().await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "ble peripheral start failed");
-                    return;
-                }
-            };
-            loop {
-                let (central_id, rx) = match peripheral.wait_for_central().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ble peripheral accept failed");
-                        return;
-                    }
-                };
-                let conn: Box<dyn Connection> = Box::new(
-                    mlink_core::transport::peripheral::MacPeripheralConnection::new(
-                        central_id.clone(), peripheral.clone(), rx,
-                    ),
-                );
-                if accepted_tx.send(conn).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        let (peer_tx, peer_rx) = mpsc::channel::<DiscoveredPeer>(16);
-        let (unsee_tx, unsee_rx) = mpsc::channel::<String>(16);
-        let scan = BleTransport::new();
-        let mut scanner = Scanner::new(Box::new(scan), app_uuid);
-        scanner.set_unsee_channel(unsee_rx);
-        tokio::spawn(async move {
-            if let Err(e) = scanner.discover_loop(peer_tx).await {
-                tracing::warn!(error = %e, "ble scanner exited");
-            }
-        });
-
-        let connect = Box::new(BleTransport::new()) as Box<dyn Transport>;
-        tokio::spawn(connect_loop(node, connect, peer_rx, accepted_rx, unsee_tx, "ble"));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = node;
-        tracing::warn!("BLE daemon transport only supported on macOS; falling back to TCP");
-        spawn_tcp(node);
-    }
-}
-
 /// Shared connect/accept driver. Mirrors the structure of `cmd_serve` in the
 /// CLI but is transport-agnostic — the caller hands us the already-configured
 /// peer/accept channels + a connect transport.
-async fn connect_loop(
+pub async fn connect_loop(
     node: Arc<Node>,
     mut connect_transport: Box<dyn Transport>,
     mut peer_rx: mpsc::Receiver<DiscoveredPeer>,
@@ -226,12 +69,9 @@ async fn connect_loop(
                         attempts.remove(&wire_id);
                         wire_to_app.insert(wire_id.clone(), app.clone());
                         connected_peers.insert(app.clone());
-                        // Drain incoming frames to the broadcast so WS clients
-                        // see MessageReceived events.
                         drop(node.spawn_peer_reader(app));
                     }
                     Err(MlinkError::RoomMismatch { .. }) => {
-                        // No retry: different room.
                         attempts.insert(wire_id.clone(), MAX_RETRIES);
                         engaged.remove(&wire_id);
                     }
