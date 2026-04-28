@@ -1,2 +1,4 @@
 [alias]
 dev = "run -p mlink-cli -- dev"
+dev-tcp = "run -p mlink-cli -- dev --transport tcp"
+dev-ble = "run -p mlink-cli -- dev --transport ble"
