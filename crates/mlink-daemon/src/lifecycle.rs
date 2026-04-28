@@ -69,7 +69,10 @@ fn pid_alive(_pid: u32) -> bool {
 
 /// Read `daemon.json` and, if it points at a live PID, refuse to start.
 /// Returns `Ok(())` when the file doesn't exist, is unparseable, or the PID
-/// is dead — any of which mean we can safely claim the slot.
+/// is dead — any of which mean we can safely claim the slot. In the stale /
+/// corrupt case we eagerly delete the file so a later crash between this
+/// check and `write_daemon_info` can't leave the old `{port,pid}` visible
+/// to `mlink status` or any other reader.
 pub fn ensure_single_instance(path: &PathBuf) -> Result<(), DaemonError> {
     let raw = match std::fs::read(path) {
         Ok(r) => r,
@@ -78,12 +81,26 @@ pub fn ensure_single_instance(path: &PathBuf) -> Result<(), DaemonError> {
     };
     let info: DaemonInfo = match serde_json::from_slice(&raw) {
         Ok(i) => i,
-        // Corrupt file — treat as stale and let the caller overwrite.
-        Err(_) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "daemon.json unparseable, cleaning up before startup"
+            );
+            remove_daemon_info(path);
+            return Ok(());
+        }
     };
     if pid_alive(info.pid) {
         return Err(DaemonError::AlreadyRunning { pid: info.pid, port: info.port });
     }
+    tracing::warn!(
+        stale_pid = info.pid,
+        stale_port = info.port,
+        path = %path.display(),
+        "daemon.json references a dead pid, cleaning up stale entry"
+    );
+    remove_daemon_info(path);
     Ok(())
 }
 
@@ -143,6 +160,22 @@ mod tests {
     }
 
     #[test]
+    fn stale_pid_removes_daemon_info() {
+        // Regression guard for the bug where `kill -9` left daemon.json on
+        // disk with `{port, pid}` for the dead process. A subsequent startup
+        // must not only ignore the stale entry but also wipe it, so status
+        // probes run between `ensure_single_instance` and `write_daemon_info`
+        // don't see the old values.
+        let dir = tempdir();
+        let path = dir.join("daemon.json");
+        let info = DaemonInfo { port: 54321, pid: 0 };
+        write_daemon_info(&path, &info).unwrap();
+        assert!(path.exists(), "precondition: file written");
+        ensure_single_instance(&path).expect("stale pid should not block startup");
+        assert!(!path.exists(), "stale daemon.json should be deleted");
+    }
+
+    #[test]
     fn missing_file_is_ok() {
         let dir = tempdir();
         let path = dir.join("nope.json");
@@ -156,6 +189,22 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{ not valid json").unwrap();
         ensure_single_instance(&path).expect("corrupt file should not block startup");
+        assert!(!path.exists(), "corrupt daemon.json should be deleted");
+    }
+
+    #[test]
+    fn live_pid_preserves_daemon_info() {
+        // When another daemon really is running, we must NOT delete its
+        // daemon.json — the error-exit path relies on the file staying put
+        // so the live owner remains discoverable.
+        let dir = tempdir();
+        let path = dir.join("daemon.json");
+        let info = DaemonInfo { port: 9999, pid: std::process::id() };
+        write_daemon_info(&path, &info).unwrap();
+        let err = ensure_single_instance(&path).unwrap_err();
+        assert!(matches!(err, DaemonError::AlreadyRunning { .. }));
+        assert!(path.exists(), "live daemon.json must be preserved");
+        remove_daemon_info(&path);
     }
 
     fn tempdir() -> PathBuf {

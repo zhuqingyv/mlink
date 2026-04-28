@@ -217,23 +217,51 @@ pub struct BoundServe {
 }
 
 impl BoundServe {
-    /// Serve until ctrl-c, then remove the daemon-info file. Idempotent on
-    /// error — the file is always cleaned up on return.
+    /// Serve until ctrl-c or SIGTERM, then remove the daemon-info file.
+    /// Idempotent on error — the file is always cleaned up on return.
+    /// SIGKILL (`kill -9`) is uncatchable; the stale-pid recovery in
+    /// `ensure_single_instance` handles that case on the next boot.
     pub async fn await_shutdown(self) -> Result<(), DaemonError> {
         let BoundServe { listener, app, info_path } = self;
         // `axum::serve(...)` returns a `Serve` future; `IntoFuture::into_future`
         // isn't in scope here, so we wrap the `.await` in an inner async block
-        // and race it against ctrl-c at the same level.
+        // and race it against the shutdown signals at the same level.
         let result = tokio::select! {
             r = async { axum::serve(listener, app).await } => r.map_err(DaemonError::from),
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("\n[mlink-daemon] shutting down");
+                eprintln!("\n[mlink-daemon] shutting down (ctrl-c)");
+                Ok(())
+            }
+            _ = wait_for_sigterm() => {
+                eprintln!("\n[mlink-daemon] shutting down (sigterm)");
                 Ok(())
             }
         };
         remove_daemon_info(&info_path);
         result
     }
+}
+
+/// Wait for SIGTERM on Unix, never resolves elsewhere. Split out of the
+/// `select!` arm so the non-Unix branch can return a pending future without
+/// disturbing the ctrl-c path.
+#[cfg(unix)]
+async fn wait_for_sigterm() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to install SIGTERM handler");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() {
+    std::future::pending::<()>().await;
 }
 
 /// Best-effort hostname lookup, used as the `name` passed to the `Node`. Falls
