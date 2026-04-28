@@ -40,7 +40,7 @@ use objc2_core_bluetooth::{
 use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSObject, NSObjectProtocol, NSString,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use uuid::Uuid;
 
 use crate::protocol::errors::{MlinkError, Result};
@@ -140,6 +140,11 @@ pub struct MacPeripheral {
     /// torn down on unsubscribe. Shared with the delegate.
     per_central_tx: PerCentralTx,
     subscribed: Arc<SubscribedCentrals>,
+    /// Notified by `peripheralManagerIsReadyToUpdateSubscribers:` when
+    /// CoreBluetooth's send queue drains and `updateValue:...` is likely to
+    /// succeed. Writes that see a full queue `.notified().await` on this
+    /// instead of polling. Shared with the delegate via its ivars.
+    update_ready: Arc<Notify>,
     local_name: String,
     room_hash: Option<[u8; 8]>,
     app_uuid: Option<String>,
@@ -159,6 +164,7 @@ impl MacPeripheral {
         let (tx, mut rx) = mpsc::unbounded_channel::<PeripheralEvent>();
         let subscribed: Arc<SubscribedCentrals> = Arc::new(SubscribedCentralsInner::new());
         let per_central_tx: PerCentralTx = Arc::new(StdMutex::new(HashMap::new()));
+        let update_ready: Arc<Notify> = Arc::new(Notify::new());
 
         let advertised_name = match room_hash {
             Some(h) => format!("{local_name}#{}", hex_encode(&h)),
@@ -200,6 +206,7 @@ impl MacPeripheral {
                 ctrl_tx: tx.clone(),
                 per_central_tx: per_central_tx.clone(),
                 subscribed: subscribed.clone(),
+                update_ready: update_ready.clone(),
                 rx_char_uuid: RX_CHAR_UUID,
                 tx_char_uuid: TX_CHAR_UUID,
             });
@@ -294,6 +301,7 @@ impl MacPeripheral {
             _ctrl_tx: tx,
             per_central_tx,
             subscribed,
+            update_ready,
             local_name,
             room_hash,
             app_uuid,
@@ -409,6 +417,10 @@ struct DelegateIvars {
     /// delegate queue in `didReceiveWriteRequests:`.
     per_central_tx: PerCentralTx,
     subscribed: Arc<SubscribedCentrals>,
+    /// Notified from `peripheralManagerIsReadyToUpdateSubscribers:` — wakes
+    /// any writer waiting on `MacPeripheral::update_ready` so it can retry
+    /// the stalled `updateValue:...` call without polling.
+    update_ready: Arc<Notify>,
     /// UUID of the notify characteristic centrals subscribe to (RX on the
     /// peripheral side, where the peripheral notifies centrals).
     rx_char_uuid: Uuid,
@@ -617,6 +629,18 @@ declare_class!(
                     );
                 }
             }
+        }
+
+        #[method(peripheralManagerIsReadyToUpdateSubscribers:)]
+        fn peripheral_manager_is_ready_to_update_subscribers(
+            &self,
+            _peripheral: &CBPeripheralManager,
+        ) {
+            // CoreBluetooth's send queue just drained. Wake every writer that
+            // parked on `update_ready` after a previous `updateValue:...`
+            // returned false — they'll retry immediately instead of waiting
+            // out the 2s safety timeout.
+            self.ivars().update_ready.notify_waiters();
         }
     }
 );
@@ -961,21 +985,29 @@ impl Connection for MacPeripheralConnection {
 
     async fn write(&self, data: &[u8]) -> Result<()> {
         // CoreBluetooth's `updateValue:forCharacteristic:onSubscribedCentrals:`
-        // returns `false` when the internal send queue is full; the correct
-        // recovery path is to wait for `peripheralManagerIsReadyToUpdateSubscribers:`
-        // and retry. We approximate with a short backoff loop so callers don't
-        // need to know about the transient-busy state.
-        let mut attempts = 0;
-        while !self.peripheral.notify_subscribed(data) {
-            attempts += 1;
-            if attempts > 50 {
-                return Err(MlinkError::HandlerError(
-                    "peripheral updateValue queue stayed full for >500ms".into(),
-                ));
+        // returns `false` when the internal send queue is full. The correct
+        // recovery signal is `peripheralManagerIsReadyToUpdateSubscribers:`
+        // (now wired into `update_ready`); we wait on that Notify instead of
+        // polling, with a 2s timeout so a truly stuck stack surfaces an error
+        // rather than hanging the caller forever.
+        loop {
+            // Re-arm the waiter BEFORE the send attempt. `Notify::notified()`
+            // only observes notifications delivered after it is created, so
+            // constructing it first closes the race where the callback fires
+            // between the failed `notify_subscribed` and our `.await`.
+            let waiter = self.peripheral.update_ready.notified();
+            if self.peripheral.notify_subscribed(data) {
+                return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::select! {
+                _ = waiter => {}
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    return Err(MlinkError::HandlerError(
+                        "peripheral updateValue queue stayed full for >2s".into(),
+                    ));
+                }
+            }
         }
-        Ok(())
     }
 
     async fn close(&self) -> Result<()> {
