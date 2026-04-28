@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use mlink_core::core::node::{Node, NodeEvent};
 use tokio::sync::broadcast;
 
+use crate::discovery::TransportControllers;
 use crate::queue::MessageQueue;
 use crate::rooms::RoomStore;
 use crate::subscription::SessionHandle;
@@ -40,4 +41,8 @@ pub struct DaemonState {
     /// being fanned to subscribers, and `join` drains the bucket so a client
     /// that reconnects doesn't lose messages received while it was gone.
     pub queue: Arc<StdMutex<MessageQueue>>,
+    /// Runtime handle for the per-transport discovery loops. WS clients use
+    /// `enable_transport` / `disable_transport` frames to toggle individual
+    /// radios on and off without restarting the daemon.
+    pub transports: TransportControllers,
 }

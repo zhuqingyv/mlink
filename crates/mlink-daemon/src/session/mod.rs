@@ -20,6 +20,7 @@ mod outbound;
 mod transport_debug;
 mod transport_forward;
 mod transport_list;
+mod transport_toggle;
 mod validate;
 
 pub use lifecycle::run;

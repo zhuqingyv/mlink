@@ -14,6 +14,10 @@ use tokio_tungstenite::WebSocketStream;
 type Ws = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect() -> Ws {
+    // Force TCP-only discovery: daemon default is now `Dual`, which would
+    // bring up a BLE peripheral on macOS and trigger a permission prompt in
+    // CI. TCP is enough for the transport-debug wire tests.
+    std::env::set_var("MLINK_DAEMON_TRANSPORT", "tcp");
     redirect_rooms_file();
     let state = build_state().await.expect("build_state");
     let app = router(state);
@@ -154,6 +158,64 @@ async fn disconnect_link_blocked_without_dev_flag() {
         .as_str()
         .unwrap()
         .contains("MLINK_DAEMON_DEV=1"));
+}
+
+#[tokio::test]
+async fn transport_state_includes_enabled_flags() {
+    // `transport_state` snapshot should report which transports are running
+    // so the UI can render the on/off checkboxes. Under `MLINK_DAEMON_TRANSPORT=tcp`
+    // only TCP is enabled.
+    let mut ws = connect().await;
+    send_json(&mut ws, json!({"v":1,"id":"te1","type":"transport_list","payload":{}})).await;
+    let snap = read_until_type(&mut ws, "transport_state").await;
+    let enabled = &snap["payload"]["transports_enabled"];
+    assert_eq!(enabled["tcp"], true);
+    assert_eq!(enabled["ble"], false);
+}
+
+#[tokio::test]
+async fn disable_then_re_enable_transport_updates_state() {
+    let mut ws = connect().await;
+    // Start state: tcp on, ble off.
+    send_json(
+        &mut ws,
+        json!({"v":1,"id":"d1","type":"disable_transport","payload":{"kind":"tcp"}}),
+    )
+    .await;
+    let ack = read_until_type(&mut ws, "ack").await;
+    assert_eq!(ack["id"], "d1");
+    // Snapshot should now show tcp disabled. Drain the list's own ack before
+    // issuing the next request so later `read_until_type("ack")` isn't tricked
+    // by a stale ack waiting in the queue.
+    send_json(&mut ws, json!({"v":1,"id":"d2","type":"transport_list","payload":{}})).await;
+    let snap = read_until_type(&mut ws, "transport_state").await;
+    assert_eq!(snap["payload"]["transports_enabled"]["tcp"], false);
+    let ack = read_until_type(&mut ws, "ack").await;
+    assert_eq!(ack["id"], "d2");
+    // Re-enable.
+    send_json(
+        &mut ws,
+        json!({"v":1,"id":"d3","type":"enable_transport","payload":{"kind":"tcp"}}),
+    )
+    .await;
+    let ack = read_until_type(&mut ws, "ack").await;
+    assert_eq!(ack["id"], "d3");
+    send_json(&mut ws, json!({"v":1,"id":"d4","type":"transport_list","payload":{}})).await;
+    let snap = read_until_type(&mut ws, "transport_state").await;
+    assert_eq!(snap["payload"]["transports_enabled"]["tcp"], true);
+}
+
+#[tokio::test]
+async fn enable_transport_rejects_unknown_kind() {
+    let mut ws = connect().await;
+    send_json(
+        &mut ws,
+        json!({"v":1,"id":"e1","type":"enable_transport","payload":{"kind":"wifi"}}),
+    )
+    .await;
+    let err = read_until_type(&mut ws, "error").await;
+    assert_eq!(err["payload"]["code"], "bad_payload");
+    assert_eq!(err["id"], "e1");
 }
 
 #[tokio::test]

@@ -331,6 +331,60 @@
     padding: 6px 2px;
   }
 
+  /* Transport enable/disable toggles */
+  .tx-toggles {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: 10px;
+  }
+  .tx-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .tx-toggle input { display: none; }
+  .tx-toggle .sw {
+    position: relative;
+    width: 28px;
+    height: 14px;
+    border-radius: 7px;
+    background: #2a3240;
+    border: 1px solid var(--border);
+    transition: background 0.15s, border-color 0.15s;
+    flex-shrink: 0;
+  }
+  .tx-toggle .sw::after {
+    content: "";
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #8a94a3;
+    transition: transform 0.15s, background 0.15s;
+  }
+  .tx-toggle input:checked + .sw {
+    background: #1d4d2f;
+    border-color: #1f4b32;
+  }
+  .tx-toggle input:checked + .sw::after {
+    transform: translateX(14px);
+    background: var(--ok);
+  }
+  .tx-toggle.disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+  .tx-toggle.disabled .sw { background: #1a1f27; }
+
   /* Peer cards */
   .tx-peer {
     border: 1px solid var(--border);
@@ -560,6 +614,18 @@
       <span class="tx-title">
         Transport
         <span class="tx-badge" id="txSupport">probing…</span>
+        <span class="tx-toggles">
+          <label class="tx-toggle" id="tgTcpLabel" title="">
+            <input type="checkbox" id="tgTcp" checked>
+            <span class="sw"></span>
+            <span>TCP</span>
+          </label>
+          <label class="tx-toggle" id="tgBleLabel" title="">
+            <input type="checkbox" id="tgBle" checked>
+            <span class="sw"></span>
+            <span>BLE</span>
+          </label>
+        </span>
       </span>
       <div>
         <button id="btnTxRefresh" style="font-size:11px;padding:2px 8px;">Refresh</button>
@@ -637,12 +703,22 @@
   // reply to a probe id. This lets the UI show a "waiting…" banner instead of
   // flip-flopping between states during the first round-trip.
   let transportSupported = null;
+  // Runtime enable/disable of whole transports. Default both true (daemon
+  // default is dual). Flipped locally on click for snappy UX, then corrected
+  // by the next `transport_state.transports_enabled` snapshot.
+  const transportsEnabled = { tcp: true, ble: true };
+  // null=probing, true=daemon accepts enable/disable_transport, false=rejected
+  // with bad_type. When false, checkboxes go grey with "upgrade daemon" hint.
+  let transportToggleSupported = null;
   // peer_id -> { active_link_id, links: [{link_id, kind, role, rtt_ema_us, err_rate_milli}], override: {kind, expiresAt} }
   const transports = new Map();
   // Pending request dedup: ids that, if they return `bad_type`, we know daemon
   // doesn't support that command and must be silenced in the raw log pane.
   // Value is an optional callback for stability-test drop accounting.
   const txPending = new Map();
+  // Pending enable/disable_transport requests: id -> { kind, enable } so we
+  // can revert the checkbox if the daemon rejects it.
+  const toggleTxPending = new Map();
   const switchLogEntries = []; // {ts, cause, peer_id, from, to}
   const SWITCH_LOG_MAX = 200;
 
@@ -693,6 +769,10 @@
   const txSupport = $("txSupport");
   const txPeerCount = $("txPeerCount");
   const btnTxRefresh = $("btnTxRefresh");
+  const tgTcp = $("tgTcp");
+  const tgBle = $("tgBle");
+  const tgTcpLabel = $("tgTcpLabel");
+  const tgBleLabel = $("tgBleLabel");
   // Stability test
   const stabPeer = $("stabPeer");
   const stabCount = $("stabCount");
@@ -792,7 +872,13 @@
       // keep stale peers around. Probe state flips back to "unknown".
       transports.clear();
       txPending.clear();
+      toggleTxPending.clear();
       transportSupported = null;
+      transportToggleSupported = null;
+      transportsEnabled.tcp = true;
+      transportsEnabled.ble = true;
+      syncToggleCheckboxes();
+      applyToggleLockState();
       renderTransports();
       setTransportBadge("probing…", "");
       if (stab.running) stopStability("socket closed");
@@ -840,7 +926,7 @@
   // transportSupported=false and let the Transport panel fall back to N/A.
   function isDualTransportProbeId(id) {
     if (!id || typeof id !== "string") return false;
-    return /^(tl|tsw|drop|stab)-/.test(id) || id === "tl-probe";
+    return /^(tl|tsw|drop|stab|dt)-/.test(id) || id === "tl-probe";
   }
 
   btnConnect.addEventListener("click", connect);
@@ -890,6 +976,17 @@
           // (ping is v1 core), so treat as structural fail and stop.
           if (typeof id === "string" && id.startsWith("stab-") && stab.inflight.has(id)) {
             onStabFail(id, "bad_type");
+          }
+          // enable/disable_transport rejected → revert local optimistic flip
+          // and lock the toggles with an "upgrade daemon" tooltip.
+          if (typeof id === "string" && id.startsWith("dt-") && toggleTxPending.has(id)) {
+            const pend = toggleTxPending.get(id);
+            toggleTxPending.delete(id);
+            if (pend) {
+              transportsEnabled[pend.kind] = !pend.enable;
+            }
+            syncToggleCheckboxes();
+            setTransportToggleSupported(false);
           }
           if (transportSupported !== true) setTransportSupported(false);
           break;
@@ -1155,6 +1252,46 @@
     }
   }
 
+  function setTransportToggleSupported(v) {
+    if (transportToggleSupported === v) return;
+    transportToggleSupported = v;
+    applyToggleLockState();
+  }
+
+  function applyToggleLockState() {
+    const locked = transportToggleSupported === false;
+    const tip = locked ? "upgrade daemon" : "";
+    for (const [input, label] of [[tgTcp, tgTcpLabel], [tgBle, tgBleLabel]]) {
+      if (!input || !label) continue;
+      input.disabled = locked;
+      if (locked) label.classList.add("disabled");
+      else label.classList.remove("disabled");
+      label.title = tip;
+    }
+  }
+
+  function syncToggleCheckboxes() {
+    if (tgTcp) tgTcp.checked = transportsEnabled.tcp !== false;
+    if (tgBle) tgBle.checked = transportsEnabled.ble !== false;
+  }
+
+  function onToggleTransport(kind, enable) {
+    // Daemon previously rejected enable/disable_transport — keep UI locked.
+    if (transportToggleSupported === false) {
+      syncToggleCheckboxes();
+      return;
+    }
+    transportsEnabled[kind] = enable;
+    const id = `dt-${idSeq++}`;
+    toggleTxPending.set(id, { kind, enable });
+    txPending.set(id, null);
+    const type = enable ? "enable_transport" : "disable_transport";
+    sendRaw({ v: 1, id, type, payload: { kind } });
+  }
+
+  if (tgTcp) tgTcp.addEventListener("change", () => onToggleTransport("tcp", tgTcp.checked));
+  if (tgBle) tgBle.addEventListener("change", () => onToggleTransport("ble", tgBle.checked));
+
   function probeTransports() {
     const id = "tl-probe";
     txPending.set(id, null);
@@ -1183,6 +1320,9 @@
   // Or, for a bulk snapshot: { peers: [ {peer_id, active_link_id, links: [...]} ] }
   function applyTransportState(p) {
     if (!p) return;
+    if (p.transports_enabled != null) {
+      applyTransportsEnabled(p.transports_enabled);
+    }
     if (Array.isArray(p.peers)) {
       // Snapshot form: replace the whole map so peers that have disconnected
       // since the last snapshot drop out.
@@ -1193,6 +1333,25 @@
     }
     renderTransports();
     refreshStabPeerOptions();
+  }
+
+  // Daemon reports which transports are currently enabled in every
+  // transport_state. Accept either {tcp:bool, ble:bool} or an array like
+  // ["tcp"] listing enabled kinds. Seeing this field at all is also a
+  // positive signal that the daemon supports enable/disable_transport.
+  function applyTransportsEnabled(raw) {
+    if (Array.isArray(raw)) {
+      const set = new Set(raw.map((k) => String(k).toLowerCase()));
+      transportsEnabled.tcp = set.has("tcp");
+      transportsEnabled.ble = set.has("ble");
+    } else if (raw && typeof raw === "object") {
+      if (typeof raw.tcp === "boolean") transportsEnabled.tcp = raw.tcp;
+      if (typeof raw.ble === "boolean") transportsEnabled.ble = raw.ble;
+    } else {
+      return;
+    }
+    setTransportToggleSupported(true);
+    syncToggleCheckboxes();
   }
 
   function upsertTransportEntry(entry) {

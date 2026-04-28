@@ -79,12 +79,19 @@ pub(super) async fn handle_transport_list(
         );
     }
 
+    let (tcp_on, ble_on) = state.transports.snapshot();
     if !send(
         socket,
         encode_frame(
             "transport_state",
             id,
-            serde_json::json!({ "peers": entries }),
+            serde_json::json!({
+                "peers": entries,
+                "transports_enabled": {
+                    "tcp": tcp_on,
+                    "ble": ble_on,
+                },
+            }),
         ),
     )
     .await

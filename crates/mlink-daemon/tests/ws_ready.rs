@@ -10,6 +10,9 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[tokio::test]
 async fn ws_sends_ready_frame_on_connect() {
+    // Force TCP-only discovery — the daemon default is now `Dual` which
+    // would bring up a BLE peripheral + OS permission prompt on macOS.
+    std::env::set_var("MLINK_DAEMON_TRANSPORT", "tcp");
     // Redirect the persistent rooms file to a temp path so the test cannot
     // mutate the user's real `~/.mlink/rooms.json`.
     use std::time::{SystemTime, UNIX_EPOCH};

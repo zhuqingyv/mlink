@@ -18,11 +18,11 @@ type Ws = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStrea
 /// Stand up a fresh daemon on localhost, return a connected WS with the
 /// auto-sent `ready` frame already drained.
 async fn connect() -> Ws {
-    // MLINK_DAEMON_TRANSPORT=tcp-nop: the discovery loop actually binds a TCP
-    // listener + mDNS service; for protocol tests we don't need real peers, but
-    // we do need the daemon to start without hitting BLE permissions on macOS.
-    // TCP is the default and is safe to run headlessly — nothing else in these
-    // tests drives real peer connections.
+    // Force TCP-only discovery: daemon default is now `Dual`, which would
+    // bring up the BLE peripheral and trigger a macOS permission prompt on
+    // CI. Protocol tests don't need real peers — TCP alone is enough to
+    // exercise the WS surface.
+    std::env::set_var("MLINK_DAEMON_TRANSPORT", "tcp");
     redirect_rooms_file();
     let state = build_state().await.expect("build_state");
     let app = router(state);

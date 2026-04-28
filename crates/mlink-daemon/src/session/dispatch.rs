@@ -6,6 +6,7 @@ use super::outbound::send;
 use super::transport_debug::{
     handle_disconnect_link, handle_transport_list, handle_transport_switch,
 };
+use super::transport_toggle::{handle_disable_transport, handle_enable_transport};
 use crate::protocol::{codes, encode_frame, Envelope, ErrorPayload};
 use crate::{DaemonState, SessionHandle, WS_PROTOCOL_VERSION};
 
@@ -58,6 +59,12 @@ pub(super) async fn handle_text(
         }
         "disconnect_link" => {
             handle_disconnect_link(socket, state, env.id.as_deref(), env.payload).await
+        }
+        "enable_transport" => {
+            handle_enable_transport(socket, state, env.id.as_deref(), env.payload).await
+        }
+        "disable_transport" => {
+            handle_disable_transport(socket, state, env.id.as_deref(), env.payload).await
         }
         other => {
             send(

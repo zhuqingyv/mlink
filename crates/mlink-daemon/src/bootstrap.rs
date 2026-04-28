@@ -157,11 +157,14 @@ pub async fn build_state() -> Result<DaemonState, DaemonError> {
     }
 
     // Kick off discovery + accept in the background so every WS client shares
-    // one scanner/peripheral pair. `DaemonTransport::from_env` is permissive —
-    // an unknown value silently falls back to TCP (safe default for CI).
-    // `"dual"` brings up BLE and TCP side by side; the shared `Arc<Node>` lets
-    // SessionManager merge two inbound links for the same peer into one Session.
-    discovery::spawn(Arc::clone(&node), discovery::DaemonTransport::from_env());
+    // one scanner/peripheral pair. `DaemonTransport::from_env` defaults to
+    // `Dual` — an unset env var boots both radios, matching the product-level
+    // expectation that the daemon speaks whatever its peers do. BLE bring-up
+    // failures downgrade to TCP-only (see `discovery::spawn`). The shared
+    // `Arc<Node>` lets SessionManager merge two inbound links for the same
+    // peer into one Session.
+    let transports =
+        discovery::spawn(Arc::clone(&node), discovery::DaemonTransport::from_env());
 
     let state = DaemonState {
         node,
@@ -169,6 +172,7 @@ pub async fn build_state() -> Result<DaemonState, DaemonError> {
         sessions,
         rooms,
         queue,
+        transports,
     };
     // Re-publish SessionEvent::Switched / StreamProgress onto every WS session.
     // LinkAdded / LinkRemoved are delivered via the NodeEvent path instead, so
