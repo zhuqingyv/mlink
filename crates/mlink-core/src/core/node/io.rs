@@ -176,6 +176,32 @@ impl Node {
                         // mark state Disconnected, fire the event. Done
                         // inline because this task only holds Arc handles,
                         // not &Node.
+                        //
+                        // Session cleanup splits by mode:
+                        //   * single-link (use_session=false): only the
+                        //     active link died — detach just that link so
+                        //     any parallel standby the scheduler later
+                        //     attached isn't mass-killed. If this was the
+                        //     only link, detach_link returns true and the
+                        //     peer is fully gone anyway.
+                        //   * multi-link (use_session=true): Session::recv
+                        //     only propagates Err after *every* link has
+                        //     already failed and been removed, so the
+                        //     session is effectively empty — drop_peer to
+                        //     finish tearing it down.
+                        if use_session {
+                            let _ = sessions.drop_peer(&peer_id).await;
+                        } else {
+                            let active_link_id = match sessions.get(&peer_id).await {
+                                Some(s) => s.active.read().await.clone(),
+                                None => None,
+                            };
+                            if let Some(lid) = active_link_id {
+                                sessions.detach_link(&peer_id, &lid).await;
+                            } else {
+                                let _ = sessions.drop_peer(&peer_id).await;
+                            }
+                        }
                         let removed = {
                             let mut guard = connections.lock().await;
                             guard.remove(&peer_id)
@@ -183,7 +209,6 @@ impl Node {
                         if let Some(conn) = removed {
                             let _ = conn.close().await;
                         }
-                        let _ = sessions.drop_peer(&peer_id).await;
                         peer_manager.remove(&peer_id).await;
                         {
                             let mut states = peer_states.write().await;

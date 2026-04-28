@@ -64,6 +64,15 @@ pub const IDENTITY_UUID_MARKER: [u8; 4] = [0x00, 0x00, 0xFF, 0xBB];
 
 const DEFAULT_MTU: usize = 512;
 const DEFAULT_SCAN_DURATION: Duration = Duration::from_secs(3);
+/// Upper bound on a single `BleConnection::read` call. btleplug's notification
+/// stream has no EOF on an idle GATT link — if the peer goes silent (app
+/// crashed, radio dropped, central walked away) the future parks forever and
+/// `spawn_peer_reader` never learns the peer is gone, which means
+/// disconnect/unsee/re-dial all stall. Bounding each read forces the reader
+/// task to surface an error so the rest of the stack can tear down and
+/// reconnect. 60s is conservative: above heartbeat (45s) so a live peer's
+/// keepalives still arrive before the timer fires.
+const BLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Encode the first 8 bytes of an app UUID string into a 128-bit service UUID.
 /// Layout: `[0x00,0x00,0xFF,0xBB] + app_uuid_bytes[0..8] + [0x00,0x00,0x00,0x00]`
@@ -443,11 +452,22 @@ impl Connection for BleConnection {
             peer_id: self.peer_id.clone(),
         })?;
         loop {
-            let n = stream.next().await.ok_or_else(|| MlinkError::PeerGone {
-                peer_id: self.peer_id.clone(),
-            })?;
-            if n.uuid == self.rx_char.uuid {
-                return Ok(n.value);
+            match tokio::time::timeout(BLE_READ_TIMEOUT, stream.next()).await {
+                Ok(Some(n)) => {
+                    if n.uuid == self.rx_char.uuid {
+                        return Ok(n.value);
+                    }
+                }
+                Ok(None) => {
+                    return Err(MlinkError::PeerGone {
+                        peer_id: self.peer_id.clone(),
+                    });
+                }
+                Err(_) => {
+                    return Err(MlinkError::PeerGone {
+                        peer_id: self.peer_id.clone(),
+                    });
+                }
             }
         }
     }

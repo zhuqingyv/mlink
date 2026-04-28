@@ -9,7 +9,7 @@ use std::time::Duration;
 use mlink_core::core::node::{Node, NodeEvent};
 use mlink_core::protocol::errors::MlinkError;
 use mlink_core::transport::{Connection, DiscoveredPeer, Transport};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// Outer timeout for dial / accept. Mirrors the CLI — long enough that a slow
 /// honest peer completes, short enough that a dead socket unwinds.
@@ -76,7 +76,7 @@ pub async fn connect_loop(
                         engaged.remove(&wire_id);
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, peer = %wire_id, "connect failed");
+                        tracing::warn!(error = %e, peer = %wire_id, transport = transport_label, "connect failed");
                         engaged.remove(&wire_id);
                         let unsee = unsee_tx.clone();
                         let id = wire_id.clone();
@@ -115,7 +115,7 @@ pub async fn connect_loop(
                         connected_inbound.remove(&wire_id);
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, peer = %wire_id, "accept failed");
+                        tracing::warn!(error = %e, peer = %wire_id, transport = transport_label, "accept failed");
                         engaged.remove(&wire_id);
                         connected_inbound.remove(&wire_id);
                     }
@@ -149,7 +149,24 @@ pub async fn connect_loop(
                         }
                     }
                     Ok(_) => {}
-                    Err(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            skipped = n,
+                            transport = transport_label,
+                            "connect_loop event receiver lagged, rebuilding state from node"
+                        );
+                        // Missed events may include PeerDisconnected, so our
+                        // bookkeeping is untrustworthy. Rebuild connected_peers
+                        // from the authoritative Node.peers() and drop the
+                        // wire→app map so every future discovery gets a fresh
+                        // dial attempt instead of being silently deduped.
+                        connected_peers.clear();
+                        wire_to_app.clear();
+                        for p in node.peers().await {
+                            connected_peers.insert(p.id);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }

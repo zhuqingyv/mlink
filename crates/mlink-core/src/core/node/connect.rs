@@ -204,10 +204,10 @@ impl Node {
             }
         }
 
-        // Legacy ConnectionManager remains the source of truth for single-link
-        // peers. Only install on the first link so subsequent secondaries don't
-        // kick out the primary's Arc.
-        if is_first_link {
+        // Always upsert the legacy ConnectionManager entry: the single-link
+        // send path (used whenever link count < 2) must be able to reach the
+        // peer over the newest link, not just the first one attached.
+        {
             let mut guard = self.connections.lock().await;
             guard.add(peer_id.clone(), Arc::clone(&conn_arc));
         }
