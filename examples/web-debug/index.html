@@ -256,7 +256,236 @@
     .col { border-right: none; border-bottom: 1px solid var(--border); max-height: 240px; }
     .col.center { max-height: none; min-height: 300px; }
     .log-wrap { height: 160px; }
+    .tx-grid { grid-template-columns: 1fr !important; }
   }
+
+  /* ===== Dual-transport panels ===== */
+  .tx-wrap {
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    max-height: 420px;
+  }
+  .tx-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .tx-head .tx-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+  }
+  .tx-head .tx-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    margin-left: 6px;
+  }
+  .tx-head .tx-badge.ok { color: var(--ok); border-color: #1f4b32; }
+  .tx-head .tx-badge.err { color: var(--err); border-color: #4a2020; }
+
+  .tx-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    min-height: 0;
+  }
+  .tx-pane {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    border-right: 1px solid var(--border);
+  }
+  .tx-pane:last-child { border-right: none; }
+  .tx-pane-head {
+    padding: 6px 10px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .tx-pane-body {
+    overflow-y: auto;
+    flex: 1;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+  .tx-empty {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+    padding: 6px 2px;
+  }
+
+  /* Peer cards */
+  .tx-peer {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel-2);
+    padding: 6px 8px;
+    margin-bottom: 8px;
+  }
+  .tx-peer-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .tx-peer-id {
+    color: var(--fg);
+    font-weight: 600;
+    font-size: 12px;
+    word-break: break-all;
+  }
+  .tx-peer-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .tx-peer-actions button {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: #152131;
+    border: 1px solid var(--border);
+  }
+  .tx-peer-actions button.active { background: #1e4b82; border-color: #2b6fb8; }
+  .tx-peer-actions button:hover:not(:disabled) { background: #203548; }
+
+  .tx-override {
+    font-size: 10px;
+    color: var(--warn);
+    margin-top: 4px;
+  }
+
+  .tx-link {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+  .tx-link.active {
+    background: #112033;
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .tx-kind {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #fff;
+  }
+  .tx-kind.ble { background: #2b6fb8; }
+  .tx-kind.tcp { background: #2e8a4f; }
+  .tx-kind.ipc { background: #a56a2b; }
+  .tx-kind.unknown { background: #555; }
+
+  .tx-role {
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+  }
+  .tx-role.active { color: var(--ok); border-color: #1f4b32; background: #0f1e16; }
+  .tx-role.standby { color: var(--muted); border-color: var(--border); background: #0f141b; }
+  .tx-role.dead { color: var(--err); border-color: #4a2020; background: #1e1212; }
+
+  .tx-stats { color: var(--muted); font-size: 10px; flex: 1; }
+
+  .tx-link button.drop-btn {
+    font-size: 10px;
+    padding: 1px 5px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .tx-link button.drop-btn:hover { color: var(--err); border-color: var(--err); }
+
+  /* Stability test */
+  .stab-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 6px 0;
+    flex-wrap: wrap;
+  }
+  .stab-row select, .stab-row input { flex: 1; min-width: 100px; }
+  .stab-row input[type="number"] { max-width: 90px; flex: 0 0 auto; }
+
+  .stab-progress {
+    height: 8px;
+    background: #0f1620;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 6px 0 4px;
+  }
+  .stab-progress-bar {
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, var(--accent), #3ddc84);
+    transition: width 120ms ease;
+  }
+  .stab-counters {
+    display: flex;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+  }
+  .stab-counters span.val { color: var(--fg); }
+
+  .stab-result {
+    background: #0d131b;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 6px 8px;
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  .stab-result table { width: 100%; border-collapse: collapse; }
+  .stab-result td { padding: 1px 4px; }
+  .stab-result td.k { color: var(--muted); width: 40%; }
+  .stab-result td.v { color: var(--fg); }
+
+  /* Switch log */
+  .switch-log { font-size: 11px; line-height: 1.5; }
+  .switch-entry {
+    padding: 3px 4px;
+    border-bottom: 1px dotted #1a2230;
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+  }
+  .switch-entry .sw-ts { color: var(--muted); flex-shrink: 0; }
+  .switch-entry .sw-cause {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 0 5px;
+    border-radius: 3px;
+    color: #fff;
+    flex-shrink: 0;
+  }
+  .switch-entry .sw-cause.active_failed { background: #a53030; }
+  .switch-entry .sw-cause.better_candidate { background: #2b6fb8; }
+  .switch-entry .sw-cause.manual { background: #555; }
+  .switch-entry .sw-cause.unknown { background: #444; }
+  .switch-entry .sw-body { color: var(--fg); word-break: break-all; }
 </style>
 </head>
 <body>
@@ -324,6 +553,71 @@
     </div>
     <div class="log-list" id="logList"></div>
   </div>
+
+  <!-- Dual-transport panels -->
+  <div class="tx-wrap">
+    <div class="tx-head">
+      <span class="tx-title">
+        Transport
+        <span class="tx-badge" id="txSupport">probing…</span>
+      </span>
+      <div>
+        <button id="btnTxRefresh" style="font-size:11px;padding:2px 8px;">Refresh</button>
+      </div>
+    </div>
+    <div class="tx-grid">
+      <div class="tx-pane">
+        <div class="tx-pane-head">
+          <span>Peers &amp; Links</span>
+          <span id="txPeerCount" style="color:var(--muted);text-transform:none;"></span>
+        </div>
+        <div class="tx-pane-body" id="txBody">
+          <div class="tx-empty" id="transportUnsupported">waiting for transport_state… (daemon may be single-transport — N/A)</div>
+        </div>
+      </div>
+      <div class="tx-pane">
+        <div class="tx-pane-head">
+          <span>Stability Test</span>
+          <span id="stabState" style="color:var(--muted);text-transform:none;">idle</span>
+        </div>
+        <div class="tx-pane-body">
+          <div class="stab-row">
+            <select id="stabPeer"><option value="">(select peer)</option></select>
+            <input type="number" id="stabCount" value="1000" min="1" max="100000">
+            <button id="btnStabRun" class="primary">Run</button>
+            <button id="btnStabStop" class="danger" disabled>Stop</button>
+          </div>
+          <div class="stab-progress"><div class="stab-progress-bar" id="stabProgress"></div></div>
+          <div class="stab-counters">
+            <span>sent <span class="val" id="stabSent">0</span></span>
+            <span>ack <span class="val" id="stabAck">0</span></span>
+            <span>fail <span class="val" id="stabFail">0</span></span>
+            <span>switches <span class="val" id="stabSwitch">0</span></span>
+          </div>
+          <div class="stab-result" id="stabResult">
+            <table><tbody>
+              <tr><td class="k">total</td><td class="v" id="stabTotal">—</td></tr>
+              <tr><td class="k">acked / failed</td><td class="v" id="stabAckFail">—</td></tr>
+              <tr><td class="k">loss%</td><td class="v" id="stabLoss">—</td></tr>
+              <tr><td class="k">avg / p50 / p95 / p99</td><td class="v" id="stabLatencies">—</td></tr>
+              <tr><td class="k">max latency</td><td class="v" id="stabMax">—</td></tr>
+              <tr><td class="k">switches</td><td class="v" id="stabSwitchFinal">—</td></tr>
+              <tr><td class="k">elapsed</td><td class="v" id="stabElapsed">—</td></tr>
+            </tbody></table>
+          </div>
+        </div>
+      </div>
+      <div class="tx-pane">
+        <div class="tx-pane-head">
+          <span>Switch Log</span>
+          <button id="btnSwitchClear" style="font-size:10px;padding:1px 6px;">Clear</button>
+        </div>
+        <div class="tx-pane-body switch-log" id="switchLog">
+          <div class="tx-empty">no switches yet</div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -335,6 +629,42 @@
   let idSeq = 1;
   const rooms = new Map();   // room -> { peers: Map<peer_id, {name}> }
   let currentRoom = null;
+
+  // ---- Dual-transport state ----
+  // transportSupported:
+  //   null = probing, true = daemon knows dual-transport, false = not supported.
+  // Stays null until we see any transport_* event OR an affirmative bad_type
+  // reply to a probe id. This lets the UI show a "waiting…" banner instead of
+  // flip-flopping between states during the first round-trip.
+  let transportSupported = null;
+  // peer_id -> { active_link_id, links: [{link_id, kind, role, rtt_ema_us, err_rate_milli}], override: {kind, expiresAt} }
+  const transports = new Map();
+  // Pending request dedup: ids that, if they return `bad_type`, we know daemon
+  // doesn't support that command and must be silenced in the raw log pane.
+  // Value is an optional callback for stability-test drop accounting.
+  const txPending = new Map();
+  const switchLogEntries = []; // {ts, cause, peer_id, from, to}
+  const SWITCH_LOG_MAX = 200;
+
+  // ---- Stability test state ----
+  const stab = {
+    running: false,
+    peerId: null,
+    total: 0,
+    sent: 0,
+    ackd: 0,
+    failed: 0,
+    switchesStart: 0,
+    inflight: new Map(), // id -> sentAtMs
+    latencies: [],
+    startedAt: 0,
+    stopReason: null,
+    idPrefix: "",
+  };
+  let stabTickTimer = null;
+  const STAB_WINDOW = 32;   // concurrent in-flight pings per worker
+  const STAB_TIMEOUT_MS = 5000;
+  let totalSwitches = 0;    // accumulated primary_changed count since page load
 
   // --- dom refs ---
   const $ = (id) => document.getElementById(id);
@@ -358,6 +688,32 @@
   const logPing = $("logPing");
   const btnClearLog = $("btnClearLog");
   const btnPing = $("btnPing");
+  // Transport panel
+  const txBody = $("txBody");
+  const txSupport = $("txSupport");
+  const txPeerCount = $("txPeerCount");
+  const btnTxRefresh = $("btnTxRefresh");
+  // Stability test
+  const stabPeer = $("stabPeer");
+  const stabCount = $("stabCount");
+  const btnStabRun = $("btnStabRun");
+  const btnStabStop = $("btnStabStop");
+  const stabProgress = $("stabProgress");
+  const stabState = $("stabState");
+  const stabSent = $("stabSent");
+  const stabAck = $("stabAck");
+  const stabFail = $("stabFail");
+  const stabSwitch = $("stabSwitch");
+  const stabTotalEl = $("stabTotal");
+  const stabAckFail = $("stabAckFail");
+  const stabLoss = $("stabLoss");
+  const stabLatencies = $("stabLatencies");
+  const stabMax = $("stabMax");
+  const stabSwitchFinal = $("stabSwitchFinal");
+  const stabElapsed = $("stabElapsed");
+  // Switch log
+  const switchLogEl = $("switchLog");
+  const btnSwitchClear = $("btnSwitchClear");
 
   // --- helpers ---
   const nowHHMMSS = () => {
@@ -432,6 +788,14 @@
       uuidText.textContent = "";
       log("·", `socket closed: code=${ev.code} reason=${ev.reason || ""}`, "warn");
       ws = null;
+      // Reset transport state so reconnecting to a different daemon doesn't
+      // keep stale peers around. Probe state flips back to "unknown".
+      transports.clear();
+      txPending.clear();
+      transportSupported = null;
+      renderTransports();
+      setTransportBadge("probing…", "");
+      if (stab.running) stopStability("socket closed");
     });
     ws.addEventListener("error", () => {
       log("·", "socket error", "err");
@@ -463,6 +827,22 @@
     return true;
   }
 
+  // Low-noise write used by stability test — 1000 ping frames would otherwise
+  // bury the raw log. Skips logging entirely while keeping the same guards.
+  function sendRawSilent(obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+
+  // Returns true if an incoming `error` frame id looks like it belongs to one
+  // of the dual-transport probes; in that case we silently flip
+  // transportSupported=false and let the Transport panel fall back to N/A.
+  function isDualTransportProbeId(id) {
+    if (!id || typeof id !== "string") return false;
+    return /^(tl|tsw|drop|stab)-/.test(id) || id === "tl-probe";
+  }
+
   btnConnect.addEventListener("click", connect);
   btnDisconnect.addEventListener("click", disconnect);
   btnPing.addEventListener("click", () => sendRaw({ v: 1, type: "ping" }));
@@ -470,7 +850,16 @@
   // --- server msg dispatch ---
   function handleServerMsg(m) {
     const isPong = m && m.type === "pong";
-    if (!isPong || logPing.checked) log("in", m);
+    // Suppress pong logs for stability-test probes regardless of checkbox — a
+    // 1000-ping run would otherwise fill the raw log with thousands of lines.
+    const isStabPong = isPong && typeof m.id === "string" && m.id.startsWith(stab.idPrefix || "__never__");
+    if (!isPong || (logPing.checked && !isStabPong)) log("in", m);
+
+    // Pong accounting for stability test happens before the switch so missing
+    // types still work.
+    if (isPong && m.id && stab.inflight.has(m.id)) {
+      onStabAck(m.id);
+    }
 
     const t = m.type || "";
     const p = m.payload || {};
@@ -478,6 +867,10 @@
       case "ready": {
         setStatus("ok", "ready");
         uuidText.textContent = p.app_uuid ? `uuid=${p.app_uuid}` : "";
+        // Probe once the session is ready — before this point the daemon may
+        // reject any command with bad_type even if it does support the new
+        // surface. transport_list acts as both a probe and a data refresh.
+        probeTransports();
         break;
       }
       case "ack": {
@@ -487,6 +880,20 @@
       case "error": {
         const code = p.code || "error";
         const msg = p.message || "";
+        const id = m.id;
+        // Silently downgrade when an old daemon rejects a dual-transport
+        // command. The panel will show "Transport info unavailable" via
+        // setTransportSupported(false).
+        if (code === "bad_type" && isDualTransportProbeId(id)) {
+          if (txPending.has(id)) txPending.delete(id);
+          // Stability test: a bad_type on our ping frames would be weird
+          // (ping is v1 core), so treat as structural fail and stop.
+          if (typeof id === "string" && id.startsWith("stab-") && stab.inflight.has(id)) {
+            onStabFail(id, "bad_type");
+          }
+          if (transportSupported !== true) setTransportSupported(false);
+          break;
+        }
         log("in", `error code=${code} msg=${msg}`, "err");
         appendSystemMsg(`error: ${code}${msg ? " — " + msg : ""}`, "error");
         break;
@@ -500,8 +907,28 @@
         break;
       }
       case "pong":
-        // already logged above
+        // already logged + handled above
         break;
+      case "transport_state": {
+        setTransportSupported(true);
+        applyTransportState(p);
+        break;
+      }
+      case "link_added": {
+        setTransportSupported(true);
+        applyLinkAdded(p);
+        break;
+      }
+      case "link_removed": {
+        setTransportSupported(true);
+        applyLinkRemoved(p);
+        break;
+      }
+      case "primary_changed": {
+        setTransportSupported(true);
+        applyPrimaryChanged(p);
+        break;
+      }
       default:
         // unknown / future types — logged already
         break;
@@ -701,6 +1128,499 @@
       appendMessage({ room: currentRoom, peerId: "", text, ts: Date.now(), self: true });
       sendInput.value = "";
     }
+  }
+
+  // ============================================================
+  // Dual-transport: panel, switch log, stability test
+  // ============================================================
+
+  function setTransportBadge(text, cls) {
+    txSupport.textContent = text;
+    txSupport.classList.remove("ok", "err");
+    if (cls) txSupport.classList.add(cls);
+  }
+
+  function setTransportSupported(v) {
+    if (transportSupported === v) return;
+    transportSupported = v;
+    if (v === true) {
+      setTransportBadge("supported", "ok");
+      const banner = $("transportUnsupported");
+      if (banner) banner.remove();
+    } else if (v === false) {
+      setTransportBadge("unsupported", "err");
+      // If we already have a peer card rendered (shouldn't happen in the
+      // unsupported case) leave it alone — only replace the banner text.
+      renderTransports();
+    }
+  }
+
+  function probeTransports() {
+    const id = "tl-probe";
+    txPending.set(id, null);
+    sendRaw({ v: 1, id, type: "transport_list" });
+  }
+
+  function shortPeer(peerId) {
+    if (!peerId) return "?";
+    if (peerId.length <= 12) return peerId;
+    return peerId.slice(0, 6) + "…" + peerId.slice(-4);
+  }
+
+  function shortLink(linkId) {
+    if (!linkId) return "?";
+    if (linkId.length <= 20) return linkId;
+    return linkId.slice(0, 10) + "…" + linkId.slice(-6);
+  }
+
+  function linkRole(link, activeId) {
+    if (link.role) return String(link.role).toLowerCase();
+    return link.link_id === activeId ? "active" : "standby";
+  }
+
+  // Apply a complete transport_state snapshot. payload shape:
+  //   { peer_id, active_link_id, links: [{link_id, transport_id, role, rtt_ema_us, err_rate_milli}] }
+  // Or, for a bulk snapshot: { peers: [ {peer_id, active_link_id, links: [...]} ] }
+  function applyTransportState(p) {
+    if (!p) return;
+    if (Array.isArray(p.peers)) {
+      // Snapshot form: replace the whole map so peers that have disconnected
+      // since the last snapshot drop out.
+      transports.clear();
+      for (const entry of p.peers) upsertTransportEntry(entry);
+    } else if (p.peer_id) {
+      upsertTransportEntry(p);
+    }
+    renderTransports();
+    refreshStabPeerOptions();
+  }
+
+  function upsertTransportEntry(entry) {
+    if (!entry || !entry.peer_id) return;
+    const prior = transports.get(entry.peer_id);
+    const links = Array.isArray(entry.links) ? entry.links.map(normalizeLink) : [];
+    transports.set(entry.peer_id, {
+      active_link_id: entry.active_link_id || null,
+      links,
+      override: prior ? prior.override : null,
+    });
+  }
+
+  function normalizeLink(l) {
+    return {
+      link_id: l.link_id,
+      transport_id: String(l.transport_id || l.kind || "unknown").toLowerCase(),
+      role: l.role ? String(l.role).toLowerCase() : null,
+      rtt_ema_us: typeof l.rtt_ema_us === "number" ? l.rtt_ema_us : 0,
+      err_rate_milli: typeof l.err_rate_milli === "number" ? l.err_rate_milli : 0,
+    };
+  }
+
+  function applyLinkAdded(p) {
+    if (!p || !p.peer_id || !p.link_id) return;
+    let t = transports.get(p.peer_id);
+    if (!t) {
+      t = { active_link_id: null, links: [], override: null };
+      transports.set(p.peer_id, t);
+    }
+    if (!t.links.some((l) => l.link_id === p.link_id)) {
+      t.links.push(normalizeLink({
+        link_id: p.link_id,
+        transport_id: p.transport_id || p.kind,
+        role: t.active_link_id ? "standby" : "active",
+        rtt_ema_us: 0,
+        err_rate_milli: 0,
+      }));
+      if (!t.active_link_id) t.active_link_id = p.link_id;
+    }
+    renderTransports();
+    refreshStabPeerOptions();
+  }
+
+  function applyLinkRemoved(p) {
+    if (!p || !p.peer_id) return;
+    const t = transports.get(p.peer_id);
+    if (!t) return;
+    t.links = t.links.filter((l) => l.link_id !== p.link_id);
+    if (t.active_link_id === p.link_id) {
+      // Leave the active field null; a primary_changed or transport_state
+      // event will fill it back in. If no links remain, drop the peer.
+      t.active_link_id = t.links[0] ? t.links[0].link_id : null;
+    }
+    if (t.links.length === 0) transports.delete(p.peer_id);
+    renderTransports();
+    refreshStabPeerOptions();
+  }
+
+  function applyPrimaryChanged(p) {
+    if (!p || !p.peer_id) return;
+    const t = transports.get(p.peer_id);
+    if (t) {
+      const toId = p.new || p.to;
+      if (toId) t.active_link_id = toId;
+      // Role hints for render — will get overwritten by next transport_state.
+      for (const l of t.links) {
+        l.role = l.link_id === t.active_link_id ? "active" : "standby";
+      }
+    }
+    appendSwitchLog({
+      ts: Date.now(),
+      peer_id: p.peer_id,
+      from: p.old || p.from,
+      to: p.new || p.to,
+      cause: p.cause || "unknown",
+    });
+    totalSwitches++;
+    if (stab.running) {
+      const now = totalSwitches - stab.switchesStart;
+      stabSwitch.textContent = String(now);
+    }
+    renderTransports();
+  }
+
+  function appendSwitchLog(entry) {
+    switchLogEntries.push(entry);
+    if (switchLogEntries.length > SWITCH_LOG_MAX) {
+      switchLogEntries.splice(0, switchLogEntries.length - SWITCH_LOG_MAX);
+    }
+    renderSwitchLog();
+  }
+
+  function renderSwitchLog() {
+    if (switchLogEntries.length === 0) {
+      switchLogEl.innerHTML = `<div class="tx-empty">no switches yet</div>`;
+      return;
+    }
+    // Newest on top — easier to see what just happened.
+    const frag = document.createDocumentFragment();
+    for (let i = switchLogEntries.length - 1; i >= 0; i--) {
+      const e = switchLogEntries[i];
+      const d = new Date(e.ts);
+      const pad = (n) => String(n).padStart(2, "0");
+      const ts = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      const causeCls = ["active_failed", "better_candidate", "manual"].includes(e.cause) ? e.cause : "unknown";
+      const div = document.createElement("div");
+      div.className = "switch-entry";
+      div.innerHTML =
+        `<span class="sw-ts">${ts}</span>` +
+        `<span class="sw-cause ${causeCls}">${escapeHtml(e.cause)}</span>` +
+        `<span class="sw-body">${escapeHtml(shortPeer(e.peer_id))}: ${escapeHtml(shortLink(e.from || "?"))} → ${escapeHtml(shortLink(e.to || "?"))}</span>`;
+      frag.appendChild(div);
+    }
+    switchLogEl.innerHTML = "";
+    switchLogEl.appendChild(frag);
+  }
+
+  btnSwitchClear.addEventListener("click", () => {
+    switchLogEntries.length = 0;
+    renderSwitchLog();
+  });
+
+  function renderTransports() {
+    const body = txBody;
+    // Clear everything except the banner, if it's still around. Using
+    // `innerHTML=""` here would orphan the banner element, so walk children.
+    const banner = $("transportUnsupported");
+    const kids = Array.from(body.childNodes);
+    for (const k of kids) {
+      if (k !== banner) body.removeChild(k);
+    }
+
+    if (transports.size === 0) {
+      txPeerCount.textContent = "";
+      // Keep / restore the banner text depending on support state.
+      if (!banner) {
+        const div = document.createElement("div");
+        div.id = "transportUnsupported";
+        div.className = "tx-empty";
+        div.textContent = transportSupported === false
+          ? "Transport info unavailable (daemon upgrade required)"
+          : "waiting for transport_state… (daemon may be single-transport — N/A)";
+        body.appendChild(div);
+      } else {
+        banner.textContent = transportSupported === false
+          ? "Transport info unavailable (daemon upgrade required)"
+          : "waiting for transport_state… (daemon may be single-transport — N/A)";
+      }
+      return;
+    }
+    // Hide / remove banner when we have real peers.
+    if (banner) banner.remove();
+    txPeerCount.textContent = `(${transports.size})`;
+
+    const frag = document.createDocumentFragment();
+    for (const [peerId, t] of transports) {
+      frag.appendChild(renderPeerCard(peerId, t));
+    }
+    body.appendChild(frag);
+  }
+
+  function renderPeerCard(peerId, t) {
+    const card = document.createElement("div");
+    card.className = "tx-peer";
+
+    const head = document.createElement("div");
+    head.className = "tx-peer-head";
+    const idEl = document.createElement("div");
+    idEl.className = "tx-peer-id";
+    idEl.textContent = shortPeer(peerId);
+    idEl.title = peerId;
+
+    const actions = document.createElement("div");
+    actions.className = "tx-peer-actions";
+    const currentOverrideKind = t.override && t.override.expiresAt > Date.now() ? t.override.kind : null;
+
+    const mkForce = (kind, label) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (currentOverrideKind === kind) b.classList.add("active");
+      b.addEventListener("click", () => forceTransport(peerId, kind));
+      return b;
+    };
+    actions.appendChild(mkForce("ble", "Force BLE"));
+    actions.appendChild(mkForce("tcp", "Force TCP"));
+
+    const autoBtn = document.createElement("button");
+    autoBtn.textContent = "Auto";
+    if (!currentOverrideKind) autoBtn.classList.add("active");
+    autoBtn.addEventListener("click", () => forceTransport(peerId, null));
+    actions.appendChild(autoBtn);
+
+    head.appendChild(idEl);
+    head.appendChild(actions);
+    card.appendChild(head);
+
+    // Override countdown — 10 minutes per contract §7 ExplicitSelector TTL.
+    if (currentOverrideKind) {
+      const remainMs = Math.max(0, t.override.expiresAt - Date.now());
+      const mins = Math.floor(remainMs / 60000);
+      const secs = Math.floor((remainMs % 60000) / 1000);
+      const line = document.createElement("div");
+      line.className = "tx-override";
+      line.textContent = `override: ${currentOverrideKind.toUpperCase()} · ${mins}m ${String(secs).padStart(2, "0")}s remaining`;
+      card.appendChild(line);
+    }
+
+    // Links
+    if (!t.links.length) {
+      const e = document.createElement("div");
+      e.className = "tx-empty";
+      e.textContent = "no links";
+      card.appendChild(e);
+    } else {
+      for (const link of t.links) {
+        card.appendChild(renderLinkRow(peerId, link, t.active_link_id));
+      }
+    }
+    return card;
+  }
+
+  function renderLinkRow(peerId, link, activeId) {
+    const row = document.createElement("div");
+    row.className = "tx-link";
+    const role = linkRole(link, activeId);
+    if (role === "active") row.classList.add("active");
+
+    const kind = (link.transport_id || "unknown").toLowerCase();
+    const kindCls = ["ble", "tcp", "ipc"].includes(kind) ? kind : "unknown";
+    const rttMs = link.rtt_ema_us ? (link.rtt_ema_us / 1000).toFixed(1) : "0";
+    const errPct = link.err_rate_milli ? (link.err_rate_milli / 10).toFixed(1) : "0";
+
+    row.innerHTML =
+      `<span class="tx-kind ${kindCls}">${escapeHtml(kind.toUpperCase())}</span>` +
+      `<span class="tx-role ${escapeHtml(role)}">${escapeHtml(role)}</span>` +
+      `<span class="tx-stats" title="${escapeHtml(link.link_id)}">${escapeHtml(shortLink(link.link_id))} · rtt ${rttMs}ms · err ${errPct}%</span>`;
+
+    const drop = document.createElement("button");
+    drop.className = "drop-btn";
+    drop.textContent = "drop";
+    drop.title = "disconnect_link (dev only)";
+    drop.addEventListener("click", () => dropLink(peerId, link.link_id));
+    row.appendChild(drop);
+    return row;
+  }
+
+  function forceTransport(peerId, toKind) {
+    const id = `tsw-${idSeq++}`;
+    txPending.set(id, null);
+    const payload = toKind ? { peer_id: peerId, to_kind: toKind } : { peer_id: peerId };
+    sendRaw({ v: 1, id, type: "transport_switch", payload });
+    const t = transports.get(peerId);
+    if (t) {
+      if (toKind) {
+        t.override = { kind: toKind, expiresAt: Date.now() + 10 * 60 * 1000 };
+      } else {
+        t.override = null;
+      }
+      renderTransports();
+    }
+  }
+
+  function dropLink(peerId, linkId) {
+    const id = `drop-${idSeq++}`;
+    txPending.set(id, null);
+    sendRaw({ v: 1, id, type: "disconnect_link", payload: { peer_id: peerId, link_id: linkId } });
+  }
+
+  btnTxRefresh.addEventListener("click", () => {
+    probeTransports();
+  });
+
+  // Override countdown tick — cheap 1s loop that just re-renders when an
+  // override is active so the remaining time visibly counts down.
+  setInterval(() => {
+    let any = false;
+    for (const t of transports.values()) {
+      if (t.override && t.override.expiresAt > Date.now()) { any = true; break; }
+    }
+    if (any) renderTransports();
+  }, 1000);
+
+  // ============================================================
+  // Stability test
+  // ============================================================
+
+  function refreshStabPeerOptions() {
+    const current = stabPeer.value;
+    const opts = [`<option value="">(select peer)</option>`];
+    for (const peerId of transports.keys()) {
+      const sel = peerId === current ? " selected" : "";
+      opts.push(`<option value="${escapeHtml(peerId)}"${sel}>${escapeHtml(shortPeer(peerId))}</option>`);
+    }
+    stabPeer.innerHTML = opts.join("");
+  }
+
+  btnStabRun.addEventListener("click", () => startStability());
+  btnStabStop.addEventListener("click", () => stopStability("user stop"));
+
+  function startStability() {
+    const peerId = stabPeer.value;
+    if (!peerId) { alert("select a peer first"); return; }
+    if (!ws || ws.readyState !== WebSocket.OPEN) { alert("not connected"); return; }
+    const total = Math.max(1, Math.min(100000, Number(stabCount.value) || 1000));
+    if (stab.running) return;
+
+    stab.running = true;
+    stab.peerId = peerId;
+    stab.total = total;
+    stab.sent = 0;
+    stab.ackd = 0;
+    stab.failed = 0;
+    stab.inflight = new Map();
+    stab.latencies = [];
+    stab.startedAt = performance.now();
+    stab.switchesStart = totalSwitches;
+    stab.idPrefix = `stab-${Date.now()}-`;
+    stab.stopReason = null;
+
+    stabState.textContent = "running…";
+    btnStabRun.disabled = true;
+    btnStabStop.disabled = false;
+    stabSent.textContent = "0";
+    stabAck.textContent = "0";
+    stabFail.textContent = "0";
+    stabSwitch.textContent = "0";
+    stabProgress.style.width = "0%";
+    clearStabResult();
+
+    // Drive pumps until target hit; window capped at 32 to avoid daemon
+    // saturation. Timeout pump runs on its own 500ms interval.
+    pumpStab();
+    stabTickTimer = setInterval(pumpStab, 100);
+  }
+
+  function pumpStab() {
+    if (!stab.running) return;
+    // timeout sweep
+    const now = performance.now();
+    for (const [id, sentAt] of stab.inflight) {
+      if (now - sentAt > STAB_TIMEOUT_MS) {
+        onStabFail(id, "timeout");
+      }
+    }
+    // fire more
+    while (stab.running && stab.sent < stab.total && stab.inflight.size < STAB_WINDOW) {
+      const id = stab.idPrefix + (stab.sent);
+      stab.inflight.set(id, performance.now());
+      stab.sent++;
+      const ok = sendRawSilent({ v: 1, id, type: "ping" });
+      if (!ok) { onStabFail(id, "send failed"); break; }
+    }
+    updateStabProgress();
+    if (stab.sent >= stab.total && stab.inflight.size === 0) {
+      finishStability("done");
+    }
+  }
+
+  function onStabAck(id) {
+    if (!stab.running) { stab.inflight.delete(id); return; }
+    const sentAt = stab.inflight.get(id);
+    if (sentAt == null) return;
+    stab.inflight.delete(id);
+    stab.ackd++;
+    stab.latencies.push(performance.now() - sentAt);
+    stabAck.textContent = String(stab.ackd);
+    updateStabProgress();
+  }
+
+  function onStabFail(id /*, reason */) {
+    if (!stab.inflight.has(id)) return;
+    stab.inflight.delete(id);
+    stab.failed++;
+    stabFail.textContent = String(stab.failed);
+    updateStabProgress();
+  }
+
+  function updateStabProgress() {
+    const done = stab.ackd + stab.failed;
+    const pct = stab.total ? Math.min(100, (done / stab.total) * 100) : 0;
+    stabProgress.style.width = pct.toFixed(1) + "%";
+    stabSent.textContent = String(stab.sent);
+  }
+
+  function stopStability(reason) {
+    if (!stab.running) return;
+    stab.stopReason = reason;
+    finishStability("stopped: " + reason);
+  }
+
+  function finishStability(label) {
+    if (!stab.running) return;
+    stab.running = false;
+    if (stabTickTimer) { clearInterval(stabTickTimer); stabTickTimer = null; }
+    // drop all remaining inflight as failed
+    for (const id of Array.from(stab.inflight.keys())) {
+      onStabFail(id, "interrupted");
+    }
+    const elapsedMs = performance.now() - stab.startedAt;
+    const lats = stab.latencies.slice().sort((a, b) => a - b);
+    const total = stab.total;
+    const ackd = stab.ackd;
+    const failed = stab.failed;
+    const avg = lats.length ? (lats.reduce((a, b) => a + b, 0) / lats.length) : 0;
+    const pct = (p) => lats.length ? lats[Math.min(lats.length - 1, Math.floor(p * lats.length))] : 0;
+    const fmt = (v) => v.toFixed(1) + "ms";
+    stabTotalEl.textContent = String(total);
+    stabAckFail.textContent = `${ackd} / ${failed}`;
+    const loss = total ? (failed / total) * 100 : 0;
+    stabLoss.textContent = loss.toFixed(2) + "%";
+    stabLatencies.textContent = `${fmt(avg)} / ${fmt(pct(0.50))} / ${fmt(pct(0.95))} / ${fmt(pct(0.99))}`;
+    stabMax.textContent = lats.length ? fmt(lats[lats.length - 1]) : "—";
+    stabSwitchFinal.textContent = String(totalSwitches - stab.switchesStart);
+    stabElapsed.textContent = (elapsedMs / 1000).toFixed(2) + "s";
+    stabState.textContent = label;
+    btnStabRun.disabled = false;
+    btnStabStop.disabled = true;
+  }
+
+  function clearStabResult() {
+    stabTotalEl.textContent = "—";
+    stabAckFail.textContent = "—";
+    stabLoss.textContent = "—";
+    stabLatencies.textContent = "—";
+    stabMax.textContent = "—";
+    stabSwitchFinal.textContent = "—";
+    stabElapsed.textContent = "—";
   }
 
   // --- init ---
