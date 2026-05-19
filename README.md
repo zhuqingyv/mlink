@@ -1,18 +1,28 @@
 English | [中文](README_CN.md)
 
-# mlink
+# MLink
 
-> Local-first device communication runtime.
+<img src="assets/mlink-logo.png" width="160" alt="MLink logo" />
 
-## What is mlink?
+> Local-first device communication runtime, evolving toward seamless LAN / WAN device and Agent connectivity.
 
-mlink is a runtime that moves bytes between your devices without touching the public internet. You start a long-lived daemon on each device; upper-layer applications — agents, knowledge bases, sync tools — connect to that daemon over a WebSocket and talk to peers across BLE or LAN. mlink is a dumb pipe: it delivers bytes, nothing more.
+## What is MLink?
+
+MLink is a runtime that moves bytes between your devices. Today, you start a long-lived daemon on each device; upper-layer applications — agents, knowledge bases, sync tools — connect to that daemon over a WebSocket and talk to peers across BLE or LAN. MLink is a dumb pipe: it delivers bytes, nothing more.
+
+## Brand Asset
+
+The current MLink logo lives at [`assets/mlink-logo.png`](assets/mlink-logo.png). MTEAM's website imports the same asset so the MLink identity stays consistent across repositories.
+
+## Product Direction
+
+MLink starts with local-first connectivity, then grows toward seamless LAN / WAN switching. The direction is phone-to-computer control, signed-in remote access, friend-to-friend Agent chat, and direct communication between a local Agent and other users' Agents.
 
 ## Architecture
 
 ```
  ┌──────────┐   WebSocket    ┌──────────────┐    BLE / TCP    ┌──────────────┐   WebSocket    ┌──────────┐
- │  Your    │ ◄────────────► │ mlink daemon │ ◄─────────────► │ mlink daemon │ ◄────────────► │  Peer    │
+ │  Your    │ ◄────────────► │ MLink daemon │ ◄─────────────► │ MLink daemon │ ◄────────────► │  Peer    │
  │  App     │   (subscribe)  │  (device A)  │   (peer link)   │  (device B)  │   (subscribe)  │  App     │
  └──────────┘                └──────────────┘                 └──────────────┘                └──────────┘
                               persistent bg svc               persistent bg svc
@@ -29,7 +39,7 @@ Single-instance lock: on startup the daemon writes `~/.mlink/daemon.json` (`{por
 - **WS client** — a *subscriber* to one or more rooms. Connecting, disconnecting, or crashing the client does **not** drop the room or the peer links.
 - **Message queue** — per-room bounded FIFO (500 messages). Messages that arrive while no client is subscribed are queued; on subscribe/reconnect the backlog is flushed, oldest first, then live messages resume.
 - **Transport** — BLE (no network required) or TCP + mDNS (same LAN). Auto-selected; no config.
-- **Dumb pipe** — mlink does not parse, interpret, or long-term-persist your payload. The 500-slot queue lives in memory only.
+- **Dumb pipe** — MLink does not parse, interpret, or long-term-persist your payload. The 500-slot queue lives in memory only.
 
 ## WebSocket Protocol (v1)
 
@@ -247,7 +257,7 @@ curl -fsSL https://raw.githubusercontent.com/zhuqingyv/mlink/main/install.sh | s
 cargo install --path crates/mlink-cli
 ```
 
-## What mlink does NOT do
+## What MLink does NOT do
 
 - No relay through the public internet.
 - No business logic — payload semantics belong to your app.

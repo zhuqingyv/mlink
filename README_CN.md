@@ -1,18 +1,28 @@
 [English](README.md) | 中文
 
-# mlink
+# MLink
 
-> 面向本地设备的通信运行时（local-first device communication runtime）。
+<img src="assets/mlink-logo.png" width="160" alt="MLink logo" />
 
-## mlink 是什么？
+> 面向本地优先设备通信的运行时，并逐步走向局域网 / 外网无感切换的设备与 Agent 连接层。
 
-mlink 是一个运行时，负责在你的设备之间搬运字节，全程不经过公网。每台设备起一个常驻 daemon；上层应用——agent、知识库、同步工具——通过 WebSocket 连到 daemon，由 daemon 走 BLE 或局域网把消息送到对端。mlink 只做一件事：送字节，是条哑管道。
+## MLink 是什么？
+
+MLink 是一个运行时，负责在你的设备之间搬运字节。当前实现中，每台设备起一个常驻 daemon；上层应用——agent、知识库、同步工具——通过 WebSocket 连到 daemon，由 daemon 走 BLE 或局域网把消息送到对端。MLink 只做一件事：送字节，是条哑管道。
+
+## 品牌资产
+
+当前 MLink logo 放在 [`assets/mlink-logo.png`](assets/mlink-logo.png)。MTEAM 官网同步使用同一张图，保证跨仓库品牌一致。
+
+## 产品方向
+
+MLink 从 local-first 连接开始，后续会走向局域网 / 外网实时切换。目标能力包括手机控制电脑、登录后的远程访问、和朋友的 Agent 聊天，以及让本地 Agent 与其他用户的 Agent 直接通信。
 
 ## 架构
 
 ```
  ┌──────────┐   WebSocket    ┌──────────────┐    BLE / TCP    ┌──────────────┐   WebSocket    ┌──────────┐
- │ 你的应用 │ ◄────────────► │ mlink daemon │ ◄─────────────► │ mlink daemon │ ◄────────────► │ 对端应用 │
+ │ 你的应用 │ ◄────────────► │ MLink daemon │ ◄─────────────► │ MLink daemon │ ◄────────────► │ 对端应用 │
  │          │    (订阅者)    │   (设备 A)   │    (设备互联)   │   (设备 B)   │    (订阅者)    │          │
  └──────────┘                └──────────────┘                 └──────────────┘                └──────────┘
                               常驻后台服务                     常驻后台服务
@@ -29,7 +39,7 @@ daemon 是常驻后台服务，它持有传输通道、对端连接，以及已�
 - **WS 客户端** —— 某些房间的*订阅者*。连上、断开、崩溃都不会让 daemon 退房或断开对端连接。
 - **消息队列** —— 每房间一条 FIFO，上限 500 条。没有订阅者在线时到达的消息进队列；客户端重连并 `join` 时，先按时间顺序把积压推完再推实时消息。
 - **Transport（传输通道）** —— BLE（无网络即可）或 TCP + mDNS（同局域网），自动选择，无需配置。
-- **哑管道** —— mlink 不解析、不解释、不做长期持久化。500 条队列只在内存里。
+- **哑管道** —— MLink 不解析、不解释、不做长期持久化。500 条队列只在内存里。
 
 ## WebSocket 协议（v1）
 
@@ -248,7 +258,7 @@ curl -fsSL https://raw.githubusercontent.com/zhuqingyv/mlink/main/install.sh | s
 cargo install --path crates/mlink-cli
 ```
 
-## mlink 不做的事
+## MLink 不做的事
 
 - 不向公网转发。
 - 不做业务逻辑，payload 含义归你自己定义。
